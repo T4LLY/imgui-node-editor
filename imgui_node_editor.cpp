@@ -37,7 +37,8 @@
 
 // LOCAL NAMESPACE TO DEFINE FLOOR FUNCTION, deprecated in imgui
 namespace {
-    void FloorRect(ImRect & rect) {
+    void FloorRect(ImRect & rect)
+    {
         rect.Min.x = IM_TRUNC(rect.Min.x);
         rect.Min.y = IM_TRUNC(rect.Min.y);
         rect.Max.x = IM_TRUNC(rect.Max.x);
