@@ -12,6 +12,12 @@ v0.9.4 (WIP):
         Retained pin geometry now follows node movement so virtual nodes remain interactive and links
         keep coherent endpoints while selected nodes are dragged.
 
+    PERF: Editor: Index retained graph geometry for large-graph queries.
+
+        Node, pin, link, and settings lookup use ID indexes instead of linear scans. Node and link
+        candidate queries use retained spatial buckets, current-frame link adjacency avoids global
+        link scans, and unchanged Z-order no longer triggers a full stable sort every frame.
+
     NEW: Tests: Add headless compatibility coverage for editor state and lifecycle APIs.
 
     NEW: CI: Test bundled ImGui and Dear ImGui 1.92.9b on Windows, Linux, and macOS.

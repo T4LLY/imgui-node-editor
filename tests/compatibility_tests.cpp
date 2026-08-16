@@ -590,6 +590,88 @@ void test_visible_link_candidates_keep_cross_view_links_interactive()
     CHECK(ed::GetHoveredLink() == ed::LinkId(900));
 }
 
+
+void test_large_virtual_graph_uses_retained_spatial_candidates()
+{
+    Fixture fixture;
+    fixture.frame([] {});
+
+    constexpr int node_count = 2048;
+    const ed::NodeId target_id(20000 + node_count - 1);
+    const ImVec2 target_position(420.0f, 300.0f);
+
+    fixture.frame_at(ImVec2(10.0f, 10.0f), [&] {
+        for (int i = 0; i < node_count; ++i)
+        {
+            const ed::NodeId id(20000 + i);
+            const ImVec2 position = i == node_count - 1
+                ? target_position
+                : ImVec2(
+                    5000.0f + static_cast<float>(i % 64) * 180.0f,
+                    5000.0f + static_cast<float>(i / 64) * 100.0f);
+
+            ed::SetNodePosition(id, position);
+            const ed::VirtualNodeDesc node = {id, ImVec2(140.0f, 64.0f), nullptr, 0};
+            CHECK(ed::SubmitVirtualNode(node));
+        }
+
+        ImGui::GetIO().MousePos = ImVec2(target_position.x + 40.0f, target_position.y + 24.0f);
+    });
+
+    CHECK(ed::GetHoveredNode() == target_id);
+    CHECK(near(ed::GetNodePosition(target_id), target_position));
+
+    ed::SelectNode(target_id);
+    CHECK(ed::IsNodeSelected(target_id));
+}
+
+void test_link_adjacency_tracks_rebound_link_endpoints()
+{
+    Fixture fixture;
+    fixture.frame([] {});
+
+    fixture.frame([] {
+        const ed::VirtualPinDesc source_pin = {
+            ed::PinId(31001), ed::PinKind::Output,
+            ImVec2(110.0f, 20.0f), ImVec2(126.0f, 36.0f),
+            ImVec2(118.0f, 24.0f), ImVec2(126.0f, 32.0f),
+        };
+        const ed::VirtualPinDesc target_a_pin = {
+            ed::PinId(31002), ed::PinKind::Input,
+            ImVec2(-6.0f, 20.0f), ImVec2(10.0f, 36.0f),
+            ImVec2(-6.0f, 24.0f), ImVec2(2.0f, 32.0f),
+        };
+        const ed::VirtualPinDesc target_b_pin = {
+            ed::PinId(31003), ed::PinKind::Input,
+            ImVec2(-6.0f, 20.0f), ImVec2(10.0f, 36.0f),
+            ImVec2(-6.0f, 24.0f), ImVec2(2.0f, 32.0f),
+        };
+
+        ed::SetNodePosition(ed::NodeId(31101), ImVec2(100.0f, 160.0f));
+        ed::SetNodePosition(ed::NodeId(31102), ImVec2(420.0f, 120.0f));
+        ed::SetNodePosition(ed::NodeId(31103), ImVec2(420.0f, 260.0f));
+
+        const ed::VirtualNodeDesc source = {ed::NodeId(31101), ImVec2(120.0f, 60.0f), &source_pin, 1};
+        const ed::VirtualNodeDesc target_a = {ed::NodeId(31102), ImVec2(120.0f, 60.0f), &target_a_pin, 1};
+        const ed::VirtualNodeDesc target_b = {ed::NodeId(31103), ImVec2(120.0f, 60.0f), &target_b_pin, 1};
+        CHECK(ed::SubmitVirtualNode(source));
+        CHECK(ed::SubmitVirtualNode(target_a));
+        CHECK(ed::SubmitVirtualNode(target_b));
+
+        CHECK(ed::Link(ed::LinkId(31999), ed::PinId(31001), ed::PinId(31002)));
+        CHECK(ed::HasAnyLinks(ed::NodeId(31102)));
+        CHECK(ed::HasAnyLinks(ed::PinId(31002)));
+
+        // Re-submitting an existing link ID with a different endpoint must
+        // update the adjacency cache transactionally in the same frame.
+        CHECK(ed::Link(ed::LinkId(31999), ed::PinId(31001), ed::PinId(31003)));
+        CHECK(!ed::HasAnyLinks(ed::NodeId(31102)));
+        CHECK(!ed::HasAnyLinks(ed::PinId(31002)));
+        CHECK(ed::HasAnyLinks(ed::NodeId(31103)));
+        CHECK(ed::HasAnyLinks(ed::PinId(31003)));
+    });
+}
+
 } // namespace
 
 int main()
@@ -607,6 +689,8 @@ int main()
     test_virtual_pin_interaction_uses_retained_bounds();
     test_retained_pin_geometry_translates_with_node();
     test_visible_link_candidates_keep_cross_view_links_interactive();
+    test_large_virtual_graph_uses_retained_spatial_candidates();
+    test_link_adjacency_tracks_rebound_link_endpoints();
 
     if (g_failures != 0)
     {

@@ -140,6 +140,79 @@ static const float c_SelectionFadeOutDuration   = 0.15f; // seconds
 static const auto  c_MaxMoveOverEdgeSpeed       = 10.0f;
 static const auto  c_MaxMoveOverEdgeDistance    = 300.0f;
 
+// Retained broad-phase index. Small nodes normally occupy one or two cells;
+// very large objects (for example a long link crossing the whole graph) stay
+// in an overflow list rather than exploding the bucket count.
+static const float    c_SpatialCellSize             = 256.0f;
+static const uint64_t c_MaxSpatialCellsPerObject    = 64;
+static const uint64_t c_MaxSpatialCellsPerQuery     = 4096;
+
+struct SpatialCellRange
+{
+    int32_t MinX;
+    int32_t MinY;
+    int32_t MaxX;
+    int32_t MaxY;
+    uint64_t CellCount;
+    bool Valid;
+};
+
+static int32_t SpatialCellCoordinate(float value)
+{
+    const auto scaled = std::floor(static_cast<double>(value) / c_SpatialCellSize);
+    if (scaled <= static_cast<double>(std::numeric_limits<int32_t>::min()))
+        return std::numeric_limits<int32_t>::min();
+    if (scaled >= static_cast<double>(std::numeric_limits<int32_t>::max()))
+        return std::numeric_limits<int32_t>::max();
+    return static_cast<int32_t>(scaled);
+}
+
+static SpatialCellRange GetSpatialCellRange(const ImRect& bounds)
+{
+    if (ImRect_IsEmpty(bounds))
+        return {0, 0, 0, 0, 0, false};
+
+    const auto minX = SpatialCellCoordinate(bounds.Min.x);
+    const auto minY = SpatialCellCoordinate(bounds.Min.y);
+    const auto maxX = SpatialCellCoordinate(bounds.Max.x);
+    const auto maxY = SpatialCellCoordinate(bounds.Max.y);
+    const auto width  = static_cast<uint64_t>(static_cast<int64_t>(maxX) - minX + 1);
+    const auto height = static_cast<uint64_t>(static_cast<int64_t>(maxY) - minY + 1);
+
+    if (height != 0 && width > std::numeric_limits<uint64_t>::max() / height)
+        return {minX, minY, maxX, maxY, std::numeric_limits<uint64_t>::max(), true};
+
+    return {minX, minY, maxX, maxY, width * height, true};
+}
+
+static uint64_t SpatialCellKey(int32_t x, int32_t y)
+{
+    return (static_cast<uint64_t>(static_cast<uint32_t>(x)) << 32) |
+           static_cast<uint32_t>(y);
+}
+
+template <typename T>
+static void AddSpatialObject(
+    std::unordered_map<uint64_t, std::vector<T*>>& buckets,
+    std::vector<T*>& overflow,
+    T* object,
+    const ImRect& bounds)
+{
+    const auto range = GetSpatialCellRange(bounds);
+    if (!range.Valid)
+        return;
+
+    if (range.CellCount > c_MaxSpatialCellsPerObject)
+    {
+        overflow.push_back(object);
+        return;
+    }
+
+    for (int64_t y = range.MinY; y <= range.MaxY; ++y)
+        for (int64_t x = range.MinX; x <= range.MaxX; ++x)
+            buckets[SpatialCellKey(static_cast<int32_t>(x), static_cast<int32_t>(y))].push_back(object);
+}
+
 #if IMGUI_VERSION_NUM > 18101
 static const auto  c_AllRoundCornersFlags = ImDrawFlags_RoundCornersAll;
 #else
@@ -646,6 +719,8 @@ bool ed::Node::AcceptDrag()
 
 void ed::Node::UpdateInteractionBounds()
 {
+    const auto previousBounds = m_InteractionBounds;
+
     m_InteractionBounds = m_Bounds;
 
     if (m_Type == NodeType::Group && !ImRect_IsEmpty(m_GroupBounds))
@@ -661,6 +736,9 @@ void ed::Node::UpdateInteractionBounds()
         if (!ImRect_IsEmpty(pin->m_Pivot))
             m_InteractionBounds.Add(pin->m_Pivot);
     }
+
+    if (previousBounds.Min != m_InteractionBounds.Min || previousBounds.Max != m_InteractionBounds.Max)
+        Editor->MarkNodeSpatialIndexDirty();
 }
 
 void ed::Node::TranslateGeometry(const ImVec2& delta)
@@ -682,6 +760,8 @@ void ed::Node::TranslateGeometry(const ImVec2& delta)
         pin->m_Bounds.Translate(delta);
         pin->m_Pivot.Translate(delta);
     }
+
+    Editor->MarkNodeSpatialIndexDirty();
 }
 
 void ed::Node::UpdateDrag(const ImVec2& offset)
@@ -984,6 +1064,7 @@ void ed::Link::Draw(ImDrawList* drawList, ImU32 color, float extraThickness) con
 
 void ed::Link::UpdateEndpoints()
 {
+    const auto previousBounds = m_Bounds;
     const auto line = m_StartPin->GetClosestLine(m_EndPin);
     m_Start = line.A;
     m_End   = line.B;
@@ -1044,6 +1125,9 @@ void ed::Link::UpdateEndpoints()
         const auto max = ImMax(p0, p1);
         m_Bounds.Add(ImRect(min, ImMax(max, min + ImVec2(1, 1))));
     }
+
+    if (previousBounds.Min != m_Bounds.Min || previousBounds.Max != m_Bounds.Max)
+        Editor->MarkLinkSpatialIndexDirty();
 }
 
 ImCubicBezierPoints ed::Link::GetCurve() const
@@ -1115,6 +1199,19 @@ ed::EditorContext::EditorContext(const ax::NodeEditor::Config* config)
     , m_Nodes()
     , m_Pins()
     , m_Links()
+    , m_NodeLookup()
+    , m_PinLookup()
+    , m_LinkLookup()
+    , m_NodeLinks()
+    , m_PinLinks()
+    , m_NodeSpatialBuckets()
+    , m_LinkSpatialBuckets()
+    , m_NodeSpatialOverflow()
+    , m_LinkSpatialOverflow()
+    , m_NodeSpatialIndexDirty(true)
+    , m_LinkSpatialIndexDirty(true)
+    , m_NextVisitStamp(1)
+    , m_ZOrderDirty(false)
     , m_VisibleLinks()
     , m_SelectionId(1)
     , m_LastActiveLink(nullptr)
@@ -1189,26 +1286,43 @@ void ed::EditorContext::Begin(const char* id, const ImVec2& size)
     if (m_LastControlActiveObject && m_LastControlActiveObject->m_DeleteOnNewFrame)
         m_LastControlActiveObject = nullptr;
 
-    static auto resetAndCollect = [](auto& objects)
+    static auto resetAndCollect = [](auto& objects, auto& lookup)
     {
-        objects.erase(std::remove_if(objects.begin(), objects.end(), [](auto objectWrapper)
+        bool removed = false;
+        objects.erase(std::remove_if(objects.begin(), objects.end(), [&lookup, &removed](auto objectWrapper)
         {
             if (objectWrapper->m_DeleteOnNewFrame)
             {
+                lookup.erase(objectWrapper.m_ID.Get());
                 delete objectWrapper.m_Object;
+                removed = true;
                 return true;
             }
-            else
-            {
-                objectWrapper->Reset();
-                return false;
-            }
+
+            objectWrapper->Reset();
+            return false;
         }), objects.end());
+        return removed;
     };
 
-    resetAndCollect(m_Nodes);
-    resetAndCollect(m_Pins);
-    resetAndCollect(m_Links);
+    const bool removedNodes = resetAndCollect(m_Nodes, m_NodeLookup);
+    resetAndCollect(m_Pins, m_PinLookup);
+    const bool removedLinks = resetAndCollect(m_Links, m_LinkLookup);
+
+    // Adjacency describes links submitted in the current frame. Rebuilding it
+    // incrementally in DoLink() avoids all-link scans in HasAnyLinks/BreakLinks.
+    for (auto& entry : m_NodeLinks)
+        entry.second.clear();
+    for (auto& entry : m_PinLinks)
+        entry.second.clear();
+
+    if (removedNodes)
+    {
+        MarkNodeSpatialIndexDirty();
+        RefreshNodeOrderIndices();
+    }
+    if (removedLinks)
+        MarkLinkSpatialIndexDirty();
 
     m_DrawList = ImGui::GetWindowDrawList();
 
@@ -1425,6 +1539,7 @@ void ed::EditorContext::End()
     m_SelectAction.Draw(m_DrawList);
 
     bool sortGroups = false;
+    bool nodeOrderChanged = false;
     if (control.ActiveNode)
     {
         if (!IsGroup(control.ActiveNode))
@@ -1432,6 +1547,7 @@ void ed::EditorContext::End()
             // Bring active node to front
             auto activeNodeIt = std::find(m_Nodes.begin(), m_Nodes.end(), control.ActiveNode);
             std::rotate(activeNodeIt, activeNodeIt + 1, m_Nodes.end());
+            nodeOrderChanged = true;
         }
         else if (!isDragging && m_CurrentAction && m_CurrentAction->AsDrag())
         {
@@ -1445,6 +1561,7 @@ void ed::EditorContext::End()
             });
 
             sortGroups = true;
+            nodeOrderChanged = true;
         }
     }
 
@@ -1465,13 +1582,23 @@ void ed::EditorContext::End()
 
             return lhsArea > rhsArea;
         });
+        nodeOrderChanged = true;
     }
 
-    // Apply Z order
-    std::stable_sort(m_Nodes.begin(), m_Nodes.end(), [](const auto& lhs, const auto& rhs)
+    // Apply Z order only when an operation could have changed ordering. This
+    // also keeps the retained spatial-index order stable on idle frames.
+    if (m_ZOrderDirty || nodeOrderChanged)
     {
-        return lhs->m_ZPosition < rhs->m_ZPosition;
-    });
+        std::stable_sort(m_Nodes.begin(), m_Nodes.end(), [](const auto& lhs, const auto& rhs)
+        {
+            return lhs->m_ZPosition < rhs->m_ZPosition;
+        });
+        m_ZOrderDirty = false;
+        nodeOrderChanged = true;
+    }
+
+    if (nodeOrderChanged)
+        RefreshNodeOrderIndices();
 
 # if 1
     // Every node has few channels assigned. Grow channel list
@@ -1665,15 +1792,19 @@ bool ed::EditorContext::DoLink(LinkId id, PinId startPinId, PinId endPinId, ImU3
     startPin->m_HasConnection = true;
       endPin->m_HasConnection = true;
 
-    auto link           = GetLink(id);
-    link->m_StartPin      = startPin;
-    link->m_EndPin        = endPin;
-    link->m_Color         = color;
-    link->m_HighlightColor= GetColor(StyleColor_HighlightLinkBorder);
-    link->m_Thickness     = thickness;
-    link->m_IsLive        = true;
+    auto link = GetLink(id);
+    if (link->m_IsLive)
+        UnregisterLinkAdjacency(link);
+
+    link->m_StartPin       = startPin;
+    link->m_EndPin         = endPin;
+    link->m_Color          = color;
+    link->m_HighlightColor = GetColor(StyleColor_HighlightLinkBorder);
+    link->m_Thickness      = thickness;
+    link->m_IsLive         = true;
 
     link->UpdateEndpoints();
+    RegisterLinkAdjacency(link);
 
     return true;
 }
@@ -1712,6 +1843,7 @@ void ed::EditorContext::SetGroupSize(NodeId nodeId, const ImVec2& size)
         node->m_GroupBounds.Max = node->m_Bounds.Min + size;
         node->m_GroupBounds.Min = ImFloor(node->m_GroupBounds.Min);
         node->m_GroupBounds.Max = ImFloor(node->m_GroupBounds.Max);
+        node->UpdateInteractionBounds();
         MakeDirty(NodeEditor::SaveReasonFlags::Size, node);
     }
 }
@@ -1743,7 +1875,11 @@ void ed::EditorContext::SetNodeZPosition(NodeId nodeId, float z)
         node->m_IsLive = false;
     }
 
-    node->m_ZPosition = z;
+    if (node->m_ZPosition != z)
+    {
+        node->m_ZPosition = z;
+        m_ZOrderDirty = true;
+    }
 }
 
 float ed::EditorContext::GetNodeZPosition(NodeId nodeId)
@@ -1817,15 +1953,13 @@ void ed::EditorContext::PrepareNodeForSubmission(Node* node)
 
             for (auto groupedNode : groupedNodes)
             {
-                groupedNode->m_Bounds.Translate(ImFloor(offset));
-                groupedNode->m_GroupBounds.Translate(ImFloor(offset));
+                groupedNode->TranslateGeometry(ImFloor(offset));
                 MakeDirty(SaveReasonFlags::Position | SaveReasonFlags::User, groupedNode);
             }
         }
         else
         {
-            node->m_Bounds.Translate(ImFloor(offset));
-            node->m_GroupBounds.Translate(ImFloor(offset));
+            node->TranslateGeometry(ImFloor(offset));
             MakeDirty(SaveReasonFlags::Position | SaveReasonFlags::User, node);
         }
     }
@@ -1866,23 +2000,251 @@ void ed::EditorContext::ApplyPinStyle(Pin* pin, PinKind kind)
     pin->m_SnapLinkToDir = editorStyle.SnapLinkToPinDir != 0.0f;
 }
 
-void ed::EditorContext::RefreshLiveLinkEndpoints()
+uint64_t ed::EditorContext::NextVisitStamp()
 {
+    ++m_NextVisitStamp;
+    if (m_NextVisitStamp == 0)
+    {
+        for (auto node : m_Nodes)
+            node->m_VisitStamp = 0;
+        for (auto pin : m_Pins)
+            pin->m_VisitStamp = 0;
+        for (auto link : m_Links)
+            link->m_VisitStamp = 0;
+        m_NextVisitStamp = 1;
+    }
+    return m_NextVisitStamp;
+}
+
+void ed::EditorContext::RefreshNodeOrderIndices()
+{
+    for (size_t i = 0; i < m_Nodes.size(); ++i)
+        m_Nodes[i]->m_OrderIndex = i;
+}
+
+void ed::EditorContext::RebuildNodeSpatialIndex()
+{
+    if (!m_NodeSpatialIndexDirty)
+        return;
+
+    m_NodeSpatialBuckets.clear();
+    m_NodeSpatialOverflow.clear();
+
+    for (auto node : m_Nodes)
+    {
+        auto bounds = node->m_InteractionBounds;
+        if (ImRect_IsEmpty(bounds))
+            bounds = node->m_Bounds;
+        AddSpatialObject(m_NodeSpatialBuckets, m_NodeSpatialOverflow, node.m_Object, bounds);
+    }
+
+    m_NodeSpatialIndexDirty = false;
+}
+
+void ed::EditorContext::RebuildLinkSpatialIndex()
+{
+    if (!m_LinkSpatialIndexDirty)
+        return;
+
+    m_LinkSpatialBuckets.clear();
+    m_LinkSpatialOverflow.clear();
+
     for (auto link : m_Links)
-        if (link->m_IsLive)
+        AddSpatialObject(m_LinkSpatialBuckets, m_LinkSpatialOverflow, link.m_Object, link->m_Bounds);
+
+    m_LinkSpatialIndexDirty = false;
+}
+
+void ed::EditorContext::QueryNodesInRect(const ImRect& r, vector<Node*>& result)
+{
+    result.clear();
+    const auto range = GetSpatialCellRange(r);
+    if (!range.Valid)
+        return;
+
+    RebuildNodeSpatialIndex();
+    const auto stamp = NextVisitStamp();
+
+    auto append = [stamp, &result](Node* node)
+    {
+        if (!node->m_IsLive || node->m_VisitStamp == stamp)
+            return;
+        node->m_VisitStamp = stamp;
+        result.push_back(node);
+    };
+
+    if (range.CellCount > c_MaxSpatialCellsPerQuery)
+    {
+        for (auto node : m_Nodes)
+            append(node.m_Object);
+    }
+    else
+    {
+        for (auto node : m_NodeSpatialOverflow)
+            append(node);
+
+        for (int64_t y = range.MinY; y <= range.MaxY; ++y)
+        {
+            for (int64_t x = range.MinX; x <= range.MaxX; ++x)
+            {
+                const auto it = m_NodeSpatialBuckets.find(
+                    SpatialCellKey(static_cast<int32_t>(x), static_cast<int32_t>(y)));
+                if (it == m_NodeSpatialBuckets.end())
+                    continue;
+                for (auto node : it->second)
+                    append(node);
+            }
+        }
+    }
+
+    std::sort(result.begin(), result.end(), [](const Node* lhs, const Node* rhs)
+    {
+        return lhs->m_OrderIndex < rhs->m_OrderIndex;
+    });
+}
+
+void ed::EditorContext::QueryLinksInRect(const ImRect& r, vector<Link*>& result)
+{
+    result.clear();
+    const auto range = GetSpatialCellRange(r);
+    if (!range.Valid)
+        return;
+
+    RebuildLinkSpatialIndex();
+    const auto stamp = NextVisitStamp();
+
+    auto append = [stamp, &result](Link* link)
+    {
+        if (!link->m_IsLive || link->m_VisitStamp == stamp)
+            return;
+        link->m_VisitStamp = stamp;
+        result.push_back(link);
+    };
+
+    if (range.CellCount > c_MaxSpatialCellsPerQuery)
+    {
+        for (auto link : m_Links)
+            append(link.m_Object);
+    }
+    else
+    {
+        for (auto link : m_LinkSpatialOverflow)
+            append(link);
+
+        for (int64_t y = range.MinY; y <= range.MaxY; ++y)
+        {
+            for (int64_t x = range.MinX; x <= range.MaxX; ++x)
+            {
+                const auto it = m_LinkSpatialBuckets.find(
+                    SpatialCellKey(static_cast<int32_t>(x), static_cast<int32_t>(y)));
+                if (it == m_LinkSpatialBuckets.end())
+                    continue;
+                for (auto link : it->second)
+                    append(link);
+            }
+        }
+    }
+
+    std::sort(result.begin(), result.end(), [](const Link* lhs, const Link* rhs)
+    {
+        return lhs->m_ID.Get() < rhs->m_ID.Get();
+    });
+}
+
+void ed::EditorContext::RegisterLinkAdjacency(Link* link)
+{
+    if (!link || !link->m_StartPin || !link->m_EndPin)
+        return;
+
+    auto appendUnique = [link](auto& map, uintptr_t key)
+    {
+        auto& links = map[key];
+        if (std::find(links.begin(), links.end(), link) == links.end())
+            links.push_back(link);
+    };
+
+    appendUnique(m_PinLinks, link->m_StartPin->m_ID.Get());
+    appendUnique(m_PinLinks, link->m_EndPin->m_ID.Get());
+
+    if (link->m_StartPin->m_Node)
+        appendUnique(m_NodeLinks, link->m_StartPin->m_Node->m_ID.Get());
+    if (link->m_EndPin->m_Node && link->m_EndPin->m_Node != link->m_StartPin->m_Node)
+        appendUnique(m_NodeLinks, link->m_EndPin->m_Node->m_ID.Get());
+}
+
+void ed::EditorContext::UnregisterLinkAdjacency(Link* link)
+{
+    if (!link)
+        return;
+
+    auto eraseLink = [link](auto& map, uintptr_t key)
+    {
+        const auto it = map.find(key);
+        if (it == map.end())
+            return;
+        auto& links = it->second;
+        links.erase(std::remove(links.begin(), links.end(), link), links.end());
+        // Keep the bucket allocated so normal per-frame link resubmission can
+        // reuse its capacity instead of reallocating adjacency vectors.
+    };
+
+    if (link->m_StartPin)
+    {
+        eraseLink(m_PinLinks, link->m_StartPin->m_ID.Get());
+        if (link->m_StartPin->m_Node)
+            eraseLink(m_NodeLinks, link->m_StartPin->m_Node->m_ID.Get());
+    }
+    if (link->m_EndPin)
+    {
+        eraseLink(m_PinLinks, link->m_EndPin->m_ID.Get());
+        if (link->m_EndPin->m_Node &&
+            (!link->m_StartPin || link->m_EndPin->m_Node != link->m_StartPin->m_Node))
+            eraseLink(m_NodeLinks, link->m_EndPin->m_Node->m_ID.Get());
+    }
+}
+
+void ed::EditorContext::RefreshLiveLinkEndpoints(const vector<Object*>& movedObjects)
+{
+    const auto stamp = NextVisitStamp();
+
+    for (auto object : movedObjects)
+    {
+        Node* node = object ? object->AsNode() : nullptr;
+        if (!node)
+        {
+            if (auto pin = object ? object->AsPin() : nullptr)
+                node = pin->m_Node;
+        }
+        if (!node)
+            continue;
+
+        const auto linksIt = m_NodeLinks.find(node->m_ID.Get());
+        if (linksIt == m_NodeLinks.end())
+            continue;
+
+        for (auto link : linksIt->second)
+        {
+            if (!link->m_IsLive || link->m_VisitStamp == stamp)
+                continue;
+            link->m_VisitStamp = stamp;
             link->UpdateEndpoints();
+        }
+    }
 }
 
 void ed::EditorContext::RebuildVisibleLinks()
 {
+    auto queryRect = ImGui::GetCurrentWindow()->ClipRect;
+    queryRect.Expand(c_LinkSelectThickness);
+
+    vector<Link*> candidates;
+    QueryLinksInRect(queryRect, candidates);
+
     m_VisibleLinks.clear();
-    m_VisibleLinks.reserve(m_Links.size());
+    m_VisibleLinks.reserve(candidates.size());
 
-    for (auto link : m_Links)
+    for (auto link : candidates)
     {
-        if (!link->m_IsLive)
-            continue;
-
         auto bounds = link->GetBounds();
         bounds.Expand(c_LinkSelectThickness);
         if (ImGui::IsRectVisible(bounds.Min, bounds.Max))
@@ -2090,7 +2452,9 @@ bool ed::EditorContext::HasSelectionChanged()
 
 ed::Node* ed::EditorContext::FindNodeAt(const ImVec2& p)
 {
-    for (auto node : m_Nodes)
+    vector<Node*> candidates;
+    QueryNodesInRect(ImRect(p - ImVec2(0.5f, 0.5f), p + ImVec2(0.5f, 0.5f)), candidates);
+    for (auto node : candidates)
         if (node->TestHit(p))
             return node;
 
@@ -2100,12 +2464,14 @@ ed::Node* ed::EditorContext::FindNodeAt(const ImVec2& p)
 void ed::EditorContext::FindNodesInRect(const ImRect& r, vector<Node*>& result, bool append, bool includeIntersecting)
 {
     if (!append)
-        result.resize(0);
+        result.clear();
 
     if (ImRect_IsEmpty(r))
         return;
 
-    for (auto node : m_Nodes)
+    vector<Node*> candidates;
+    QueryNodesInRect(r, candidates);
+    for (auto node : candidates)
         if (node->TestHit(r, includeIntersecting))
             result.push_back(node);
 }
@@ -2113,78 +2479,53 @@ void ed::EditorContext::FindNodesInRect(const ImRect& r, vector<Node*>& result, 
 void ed::EditorContext::FindLinksInRect(const ImRect& r, vector<Link*>& result, bool append)
 {
     if (!append)
-        result.resize(0);
+        result.clear();
 
     if (ImRect_IsEmpty(r))
         return;
 
-    // Selection rectangles may extend outside the current clip rect while
-    // dragging, so preserve full-scene behavior here. Cached link geometry
-    // still avoids recomputing Bezier bounds for every candidate.
-    for (auto link : m_Links)
+    vector<Link*> candidates;
+    QueryLinksInRect(r, candidates);
+    for (auto link : candidates)
         if (link->TestHit(r))
             result.push_back(link);
 }
 
 bool ed::EditorContext::HasAnyLinks(NodeId nodeId) const
 {
-    for (auto link : m_Links)
-    {
-        if (!link->m_IsLive)
-            continue;
-
-        if (link->m_StartPin->m_Node->m_ID == nodeId || link->m_EndPin->m_Node->m_ID == nodeId)
-            return true;
-    }
-
-    return false;
+    const auto it = m_NodeLinks.find(nodeId.Get());
+    return it != m_NodeLinks.end() && !it->second.empty();
 }
 
 bool ed::EditorContext::HasAnyLinks(PinId pinId) const
 {
-    for (auto link : m_Links)
-    {
-        if (!link->m_IsLive)
-            continue;
-
-        if (link->m_StartPin->m_ID == pinId || link->m_EndPin->m_ID == pinId)
-            return true;
-    }
-
-    return false;
+    const auto it = m_PinLinks.find(pinId.Get());
+    return it != m_PinLinks.end() && !it->second.empty();
 }
 
 int ed::EditorContext::BreakLinks(NodeId nodeId)
 {
-    int result = 0;
-    for (auto link : m_Links)
-    {
-        if (!link->m_IsLive)
-            continue;
+    const auto it = m_NodeLinks.find(nodeId.Get());
+    if (it == m_NodeLinks.end())
+        return 0;
 
-        if (link->m_StartPin->m_Node->m_ID == nodeId || link->m_EndPin->m_Node->m_ID == nodeId)
-        {
-            if (GetItemDeleter().Add(link))
-                ++result;
-        }
-    }
+    int result = 0;
+    for (auto link : it->second)
+        if (link->m_IsLive && GetItemDeleter().Add(link))
+            ++result;
     return result;
 }
 
 int ed::EditorContext::BreakLinks(PinId pinId)
 {
-    int result = 0;
-    for (auto link : m_Links)
-    {
-        if (!link->m_IsLive)
-            continue;
+    const auto it = m_PinLinks.find(pinId.Get());
+    if (it == m_PinLinks.end())
+        return 0;
 
-        if (link->m_StartPin->m_ID == pinId || link->m_EndPin->m_ID == pinId)
-        {
-            if (GetItemDeleter().Add(link))
-                ++result;
-        }
-    }
+    int result = 0;
+    for (auto link : it->second)
+        if (link->m_IsLive && GetItemDeleter().Add(link))
+            ++result;
     return result;
 }
 
@@ -2193,14 +2534,19 @@ void ed::EditorContext::FindLinksForNode(NodeId nodeId, vector<Link*>& result, b
     if (!add)
         result.clear();
 
-    for (auto link : m_Links)
-    {
-        if (!link->m_IsLive)
-            continue;
+    const auto it = m_NodeLinks.find(nodeId.Get());
+    if (it == m_NodeLinks.end())
+        return;
 
-        if (link->m_StartPin->m_Node->m_ID == nodeId || link->m_EndPin->m_Node->m_ID == nodeId)
+    const auto firstAdded = result.size();
+    for (auto link : it->second)
+        if (link->m_IsLive)
             result.push_back(link);
-    }
+
+    std::sort(result.begin() + firstAdded, result.end(), [](const Link* lhs, const Link* rhs)
+    {
+        return lhs->m_ID.Get() < rhs->m_ID.Get();
+    });
 }
 
 bool ed::EditorContext::PinHadAnyLinks(PinId pinId)
@@ -2287,6 +2633,7 @@ ed::Pin* ed::EditorContext::CreatePin(PinId id, PinKind kind)
     IM_ASSERT(nullptr == FindObject(id));
     auto pin = new Pin(this, id, kind);
     m_Pins.push_back({id, pin});
+    m_PinLookup[id.Get()] = pin;
     std::sort(m_Pins.begin(), m_Pins.end());
     return pin;
 }
@@ -2295,7 +2642,11 @@ ed::Node* ed::EditorContext::CreateNode(NodeId id)
 {
     IM_ASSERT(nullptr == FindObject(id));
     auto node = new Node(this, id);
+    node->m_OrderIndex = m_Nodes.size();
     m_Nodes.push_back({id, node});
+    m_NodeLookup[id.Get()] = node;
+    m_ZOrderDirty = true;
+    MarkNodeSpatialIndexDirty();
     //std::sort(Nodes.begin(), Nodes.end());
 
     auto settings = m_Settings.FindNode(id);
@@ -2317,66 +2668,29 @@ ed::Link* ed::EditorContext::CreateLink(LinkId id)
     IM_ASSERT(nullptr == FindObject(id));
     auto link = new Link(this, id);
     m_Links.push_back({id, link});
+    m_LinkLookup[id.Get()] = link;
+    MarkLinkSpatialIndexDirty();
     std::sort(m_Links.begin(), m_Links.end());
 
     return link;
 }
 
-template <typename C, typename Id>
-static inline auto FindItemInLinear(C& container, Id id)
-{
-# if defined(_DEBUG)
-    auto start = container.data();
-    auto end   = container.data() + container.size();
-    for (auto it = start; it < end; ++it)
-        if ((*it).m_ID == id)
-            return it->m_Object;
-# else
-    for (auto item : container)
-        if (item.m_ID == id)
-            return item.m_Object;
-# endif
-
-   return static_cast<decltype(container[0].m_Object)>(nullptr);
-}
-
-template <typename C, typename Id>
-static inline auto FindItemIn(C& container, Id id)
-{
-//# if defined(_DEBUG)
-//    auto start = container.data();
-//    auto end   = container.data() + container.size();
-//    for (auto it = start; it < end; ++it)
-//        if ((*it)->ID == id)
-//            return *it;
-//# else
-//    for (auto item : container)
-//        if (item->ID == id)
-//            return item;
-//# endif
-    auto key = typename C::value_type{ id, nullptr };
-    auto first = container.cbegin();
-    auto last  = container.cend();
-    auto it    = std::lower_bound(first, last, key);
-    if (it != last && (key.m_ID == it->m_ID))
-        return it->m_Object;
-    else
-        return static_cast<decltype(it->m_Object)>(nullptr);
-}
-
 ed::Node* ed::EditorContext::FindNode(NodeId id)
 {
-    return FindItemInLinear(m_Nodes, id);
+    const auto it = m_NodeLookup.find(id.Get());
+    return it != m_NodeLookup.end() ? it->second : nullptr;
 }
 
 ed::Pin* ed::EditorContext::FindPin(PinId id)
 {
-    return FindItemIn(m_Pins, id);
+    const auto it = m_PinLookup.find(id.Get());
+    return it != m_PinLookup.end() ? it->second : nullptr;
 }
 
 ed::Link* ed::EditorContext::FindLink(LinkId id)
 {
-    return FindItemIn(m_Links, id);
+    const auto it = m_LinkLookup.find(id.Get());
+    return it != m_LinkLookup.end() ? it->second : nullptr;
 }
 
 ed::Object* ed::EditorContext::FindObject(ObjectId id)
@@ -2681,51 +2995,56 @@ ed::Control ed::EditorContext::BuildControl(bool allowOffscreen)
             activeObject = object;
     };
 
-    auto objectBelongsToNode = [](Object* object, Node* node)
+    auto nodeForObject = [](Object* object) -> Node*
     {
         if (!object)
-            return false;
-        if (object == node)
-            return true;
+            return nullptr;
+        if (auto node = object->AsNode())
+            return node;
         if (auto pin = object->AsPin())
-            return pin->m_Node == node;
-        return false;
+            return pin->m_Node;
+        return nullptr;
     };
 
-    auto needsInteractionSubmission = [this, mousePos, &objectBelongsToNode](Node* node)
+    vector<Node*> interactionNodes;
+    QueryNodesInRect(
+        ImRect(mousePos - ImVec2(0.5f, 0.5f), mousePos + ImVec2(0.5f, 0.5f)),
+        interactionNodes);
+
+    auto appendInteractionNode = [&interactionNodes](Node* node)
     {
-        if (node->m_InteractionBounds.Contains(mousePos))
-            return true;
-
-        if (objectBelongsToNode(m_LastControlActiveObject, node))
-            return true;
-
-        if (m_CurrentAction)
-        {
-            if (auto drag = m_CurrentAction->AsDrag())
-                if (objectBelongsToNode(drag->m_DraggedObject, node))
-                    return true;
-
-            if (auto size = m_CurrentAction->AsSize())
-                if (size->m_SizedNode == node)
-                    return true;
-        }
-
-        return false;
+        if (!node || !node->m_IsLive)
+            return;
+        if (std::find(interactionNodes.begin(), interactionNodes.end(), node) == interactionNodes.end())
+            interactionNodes.push_back(node);
     };
 
-    // Process live nodes and pins. Geometry checks stay O(N), but only the
-    // node under the cursor (or an active drag/size target) emits ImGui items.
-    for (auto nodeIt = m_Nodes.rbegin(), nodeItEnd = m_Nodes.rend(); nodeIt != nodeItEnd; ++nodeIt)
+    // Active interactions must continue even after the cursor leaves the
+    // indexed bounds (for example while dragging a node beyond the viewport).
+    appendInteractionNode(nodeForObject(m_LastControlActiveObject));
+    if (m_CurrentAction)
+    {
+        if (auto drag = m_CurrentAction->AsDrag())
+            appendInteractionNode(nodeForObject(drag->m_DraggedObject));
+        if (auto size = m_CurrentAction->AsSize())
+            appendInteractionNode(size->m_SizedNode);
+    }
+
+    std::sort(interactionNodes.begin(), interactionNodes.end(), [](const Node* lhs, const Node* rhs)
+    {
+        return lhs->m_OrderIndex < rhs->m_OrderIndex;
+    });
+
+    // The broad phase normally leaves only the node under the cursor plus any
+    // active drag/resize target, so off-screen virtual nodes create no ImGui
+    // interaction items and require no full-node scan here.
+    for (auto nodeIt = interactionNodes.rbegin(), nodeItEnd = interactionNodes.rend(); nodeIt != nodeItEnd; ++nodeIt)
     {
         auto node = *nodeIt;
 
-        if (!node->m_IsLive) continue;
-        if (!needsInteractionSubmission(node)) continue;
-
         // Check for interactions with live pins in node before
-        // processing node itself. Pins does not overlap each other
-        // and all are within node bounds.
+        // processing node itself. Pins can extend outside node bounds; the
+        // retained interaction bounds used by the spatial index includes them.
         for (auto pin = node->m_LastPin; pin; pin = pin->m_PreviousPin)
         {
             if (!pin->m_IsLive) continue;
@@ -3036,16 +3355,16 @@ bool ed::NodeSettings::Parse(const json::value& data, NodeSettings& result)
 ed::NodeSettings* ed::Settings::AddNode(NodeId id)
 {
     m_Nodes.push_back(NodeSettings(id));
+    m_NodeLookup[id.Get()] = m_Nodes.size() - 1;
     return &m_Nodes.back();
 }
 
 ed::NodeSettings* ed::Settings::FindNode(NodeId id)
 {
-    for (auto& settings : m_Nodes)
-        if (settings.m_ID == id)
-            return &settings;
-
-    return nullptr;
+    const auto it = m_NodeLookup.find(id.Get());
+    if (it == m_NodeLookup.end() || it->second >= m_Nodes.size())
+        return nullptr;
+    return &m_Nodes[it->second];
 }
 
 void ed::Settings::RemoveNode(NodeId id)
@@ -4105,6 +4424,7 @@ bool ed::SizeAction::Process(const Control& control)
         m_SizedNode->m_GroupBounds.Min.y -= m_StartBounds.Min.y - m_StartGroupBounds.Min.y;
         m_SizedNode->m_GroupBounds.Max.x -= m_StartBounds.Max.x - m_StartGroupBounds.Max.x;
         m_SizedNode->m_GroupBounds.Max.y -= m_StartBounds.Max.y - m_StartGroupBounds.Max.y;
+        m_SizedNode->UpdateInteractionBounds();
     }
     else if (!control.ActiveNode)
     {
@@ -4311,7 +4631,7 @@ bool ed::DragAction::Process(const Control& control)
         for (auto object : m_Objects)
             object->UpdateDrag(dragOffset);
 
-        Editor->RefreshLiveLinkEndpoints();
+        Editor->RefreshLiveLinkEndpoints(m_Objects);
     }
     else if (!control.ActiveObject)
     {

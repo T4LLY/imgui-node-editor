@@ -127,9 +127,14 @@ else
 `GetNodeBackgroundDrawList()` returns `nullptr` for a virtual node because no node draw channels
 are allocated. Native `Group()` nodes are intentionally not virtualized by this initial API.
 
-Interaction hit testing remains geometry-driven: the editor scans retained node bounds, but only the
-cursor candidate and active drag/size target emit ImGui interaction items. Retained pin bounds and
-pivots move with their node, so selected virtual nodes can move without rebuilding their contents.
+Interaction hit testing remains geometry-driven: retained node and link bounds are indexed in spatial
+buckets, so only nearby candidates are considered before exact hit testing. Only the cursor candidate
+and active drag/size target emit ImGui interaction items. Retained pin bounds and pivots move with
+their node, so selected virtual nodes can move without rebuilding their contents.
+
+Node, pin, and link ID lookup plus current-frame link adjacency are indexed internally. This requires
+no additional application API and removes several whole-graph scans from interaction, drag, and link
+queries on large graphs.
 
 ### Quick Start
 

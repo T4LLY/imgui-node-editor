@@ -32,6 +32,10 @@
 
 # include <vector>
 # include <string>
+# include <unordered_map>
+# include <cstdint>
+# include <cstddef>
+# include <limits>
 
 
 //------------------------------------------------------------------------------
@@ -218,15 +222,17 @@ struct Object
 
     EditorContext* const Editor;
 
-    bool    m_IsLive;
-    bool    m_IsSelected;
-    bool    m_DeleteOnNewFrame;
+    bool     m_IsLive;
+    bool     m_IsSelected;
+    bool     m_DeleteOnNewFrame;
+    uint64_t m_VisitStamp;
 
     Object(EditorContext* editor)
         : Editor(editor)
         , m_IsLive(true)
         , m_IsSelected(false)
         , m_DeleteOnNewFrame(false)
+        , m_VisitStamp(0)
     {
     }
 
@@ -393,6 +399,7 @@ struct Node final: Object
     ImRect   m_Bounds;
     ImRect   m_InteractionBounds;
     float    m_ZPosition;
+    size_t   m_OrderIndex;
     int      m_Channel;
     Pin*     m_LastPin;
     ImVec2   m_DragStart;
@@ -421,6 +428,7 @@ struct Node final: Object
         , m_Bounds()
         , m_InteractionBounds()
         , m_ZPosition(0.0f)
+        , m_OrderIndex(0)
         , m_Channel(0)
         , m_LastPin(nullptr)
         , m_DragStart()
@@ -559,8 +567,9 @@ struct Settings
     bool                 m_IsDirty;
     SaveReasonFlags      m_DirtyReason;
 
-    vector<NodeSettings> m_Nodes;
-    vector<ObjectId>     m_Selection;
+    vector<NodeSettings>                    m_Nodes;
+    std::unordered_map<uintptr_t, size_t>     m_NodeLookup;
+    vector<ObjectId>                          m_Selection;
     ImVec2               m_ViewScroll;
     float                m_ViewZoom;
     ImRect               m_VisibleRect;
@@ -1365,8 +1374,20 @@ struct EditorContext
     void PrepareNodeForSubmission(Node* node);
     void ApplyNodeStyle(Node* node);
     void ApplyPinStyle(Pin* pin, PinKind kind);
-    void RefreshLiveLinkEndpoints();
+    void RefreshLiveLinkEndpoints(const vector<Object*>& movedObjects);
     void RebuildVisibleLinks();
+
+    void MarkNodeSpatialIndexDirty() { m_NodeSpatialIndexDirty = true; }
+    void MarkLinkSpatialIndexDirty() { m_LinkSpatialIndexDirty = true; }
+    void RebuildNodeSpatialIndex();
+    void RebuildLinkSpatialIndex();
+    void QueryNodesInRect(const ImRect& r, vector<Node*>& result);
+    void QueryLinksInRect(const ImRect& r, vector<Link*>& result);
+    void RefreshNodeOrderIndices();
+
+    void RegisterLinkAdjacency(Link* link);
+    void UnregisterLinkAdjacency(Link* link);
+    uint64_t NextVisitStamp();
 
     void RemoveSettings(Object* object);
 
@@ -1540,7 +1561,25 @@ private:
     vector<ObjectWrapper<Node>> m_Nodes;
     vector<ObjectWrapper<Pin>>  m_Pins;
     vector<ObjectWrapper<Link>> m_Links;
-    vector<Link*>               m_VisibleLinks;
+
+    std::unordered_map<uintptr_t, Node*> m_NodeLookup;
+    std::unordered_map<uintptr_t, Pin*>  m_PinLookup;
+    std::unordered_map<uintptr_t, Link*> m_LinkLookup;
+
+    std::unordered_map<uintptr_t, vector<Link*>> m_NodeLinks;
+    std::unordered_map<uintptr_t, vector<Link*>> m_PinLinks;
+
+    std::unordered_map<uint64_t, vector<Node*>> m_NodeSpatialBuckets;
+    std::unordered_map<uint64_t, vector<Link*>> m_LinkSpatialBuckets;
+    vector<Node*> m_NodeSpatialOverflow;
+    vector<Link*> m_LinkSpatialOverflow;
+    bool          m_NodeSpatialIndexDirty;
+    bool          m_LinkSpatialIndexDirty;
+    uint64_t      m_NextVisitStamp;
+
+    bool          m_ZOrderDirty;
+
+    vector<Link*> m_VisibleLinks;
 
     vector<Object*>     m_SelectedObjects;
 
