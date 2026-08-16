@@ -1,5 +1,9 @@
 v0.9.4 (WIP):
 
+    NEW: Tests: Add headless compatibility coverage for editor state and lifecycle APIs.
+
+    NEW: CI: Test bundled ImGui and Dear ImGui 1.92.9b on Windows, Linux, and macOS.
+
     CHANGE: Editor: Support Dear ImGui 1.92.9b without obsolete API shims.
 
     BUGFIX: Editor: Avoid ImVec2 scalar multiplication operator collision with Dear ImGui 1.92.7+.

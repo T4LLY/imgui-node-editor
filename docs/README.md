@@ -82,6 +82,28 @@ Build:
 ```
 Executables will be located in `build\bin` directory.
 
+### Compatibility tests
+
+The headless compatibility suite exercises node/link submission, selection, node position state,
+groups, suspend/resume, navigation transforms, programmatic deletion, settings restore, and
+repeated-frame lifetime behavior. It can be built against the bundled ImGui or an external
+Dear ImGui source tree.
+
+```
+cmake -S tests -B build-tests -DCMAKE_BUILD_TYPE=Release
+cmake --build build-tests --config Release
+ctest --test-dir build-tests -C Release --output-on-failure
+
+# Test another Dear ImGui checkout, for example 1.92.9b:
+cmake -S tests -B build-tests-1.92.9b -DCMAKE_BUILD_TYPE=Release \
+  -DIMGUI_NODE_EDITOR_IMGUI_DIR=/path/to/imgui
+cmake --build build-tests-1.92.9b --config Release
+ctest --test-dir build-tests-1.92.9b -C Release --output-on-failure
+```
+
+CI runs this suite against both the bundled ImGui and Dear ImGui 1.92.9b on Windows, Linux,
+and macOS.
+
 ### Quick Start
 
 Main node editor header is located in [imgui_node_editor.h](../imgui_node_editor.h).

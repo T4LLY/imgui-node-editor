@@ -59,3 +59,33 @@ jobs:
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}}
       
+  Compatibility:
+    name: Compatibility (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Checkout Dear ImGui 1.92.9b
+      uses: actions/checkout@v4
+      with:
+        repository: ocornut/imgui
+        ref: v1.92.9b
+        path: _deps/imgui-1.92.9b
+
+    - name: Configure bundled ImGui compatibility tests
+      run: cmake -S tests -B build-compat-bundled -DCMAKE_BUILD_TYPE=Release
+    - name: Build bundled ImGui compatibility tests
+      run: cmake --build build-compat-bundled --config Release
+    - name: Run bundled ImGui compatibility tests
+      run: ctest --test-dir build-compat-bundled -C Release --output-on-failure
+
+    - name: Configure Dear ImGui 1.92.9b compatibility tests
+      run: cmake -S tests -B build-compat-1.92.9b -DCMAKE_BUILD_TYPE=Release "-DIMGUI_NODE_EDITOR_IMGUI_DIR=${{ github.workspace }}/_deps/imgui-1.92.9b"
+    - name: Build Dear ImGui 1.92.9b compatibility tests
+      run: cmake --build build-compat-1.92.9b --config Release
+    - name: Run Dear ImGui 1.92.9b compatibility tests
+      run: ctest --test-dir build-compat-1.92.9b -C Release --output-on-failure
