@@ -40,6 +40,8 @@ namespace NodeEditor {
 struct NodeId;
 struct LinkId;
 struct PinId;
+struct VirtualPinDesc;
+struct VirtualNodeDesc;
 
 
 //------------------------------------------------------------------------------
@@ -307,6 +309,15 @@ IMGUI_NODE_EDITOR_API void Begin(const char* id, const ImVec2& size = ImVec2(0, 
 IMGUI_NODE_EDITOR_API void End();
 
 IMGUI_NODE_EDITOR_API void BeginNode(NodeId id);
+// Submit a node without emitting ImGui contents or allocating node draw channels.
+// The descriptor uses node-local pin geometry and is intended for retained,
+// off-screen nodes whose layout has already been measured by a full submission.
+IMGUI_NODE_EDITOR_API bool SubmitVirtualNode(const VirtualNodeDesc& desc);
+// Returns true when the retained node bounds overlap the current canvas view.
+// Unknown or not-yet-measured nodes return true so callers perform a full pass.
+IMGUI_NODE_EDITOR_API bool IsNodeVisible(NodeId id, float margin = 0.0f);
+// Returns the current visible canvas bounds in node-editor (canvas-local) space.
+IMGUI_NODE_EDITOR_API void GetVisibleCanvasBounds(ImVec2* min, ImVec2* max);
 IMGUI_NODE_EDITOR_API void BeginPin(PinId id, PinKind kind);
 IMGUI_NODE_EDITOR_API void PinRect(const ImVec2& a, const ImVec2& b);
 IMGUI_NODE_EDITOR_API void PinPivotRect(const ImVec2& a, const ImVec2& b);
@@ -518,6 +529,28 @@ struct LinkId final: Details::SafePointerType<LinkId>
 struct PinId final: Details::SafePointerType<PinId>
 {
     using SafePointerType::SafePointerType;
+};
+
+// Retained geometry for a pin on a virtual node. All coordinates are offsets
+// from the node origin, not absolute screen/canvas coordinates.
+struct VirtualPinDesc
+{
+    PinId   Id;
+    PinKind Kind;
+    ImVec2  BoundsMinOffset;
+    ImVec2  BoundsMaxOffset;
+    ImVec2  PivotMinOffset;
+    ImVec2  PivotMaxOffset;
+};
+
+// Retained geometry for a lightweight node submission. Native Group() nodes
+// are deliberately not supported by the initial virtual-node path.
+struct VirtualNodeDesc
+{
+    NodeId                Id;
+    ImVec2                Size;
+    const VirtualPinDesc* Pins;
+    int                   PinCount;
 };
 
 

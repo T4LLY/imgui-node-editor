@@ -358,6 +358,13 @@ enum class NodeType
     Group
 };
 
+enum class NodeSubmissionKind : uint8_t
+{
+    None,
+    Full,
+    Virtual,
+};
+
 enum class NodeRegion : uint8_t
 {
     None        = 0x00,
@@ -388,6 +395,7 @@ struct Node final: Object
     int      m_Channel;
     Pin*     m_LastPin;
     ImVec2   m_DragStart;
+    NodeSubmissionKind m_Submission;
 
     ImU32    m_Color;
     ImU32    m_BorderColor;
@@ -414,6 +422,7 @@ struct Node final: Object
         , m_Channel(0)
         , m_LastPin(nullptr)
         , m_DragStart()
+        , m_Submission(NodeSubmissionKind::None)
         , m_Color(IM_COL32_WHITE)
         , m_BorderColor(IM_COL32_BLACK)
         , m_BorderWidth(0)
@@ -424,6 +433,16 @@ struct Node final: Object
         , m_CenterOnScreen(false)
     {
     }
+
+    virtual void Reset() override final
+    {
+        Object::Reset();
+        m_Submission = NodeSubmissionKind::None;
+        m_LastPin    = nullptr;
+    }
+
+    bool IsFullSubmitted() const { return m_Submission == NodeSubmissionKind::Full; }
+    bool IsVirtualSubmitted() const { return m_Submission == NodeSubmissionKind::Virtual; }
 
     virtual ObjectId ID() override { return m_ID; }
 
@@ -1301,6 +1320,10 @@ struct EditorContext
     void Begin(const char* id, const ImVec2& size = ImVec2(0, 0));
     void End();
 
+    bool SubmitVirtualNode(const VirtualNodeDesc& desc);
+    bool IsNodeVisible(NodeId id, float margin);
+    void GetVisibleCanvasBounds(ImVec2* min, ImVec2* max) const;
+
     bool DoLink(LinkId id, PinId startPinId, PinId endPinId, ImU32 color, float thickness);
 
 
@@ -1328,6 +1351,9 @@ struct EditorContext
 
     void MarkNodeToRestoreState(Node* node);
     void UpdateNodeState(Node* node);
+    void PrepareNodeForSubmission(Node* node);
+    void ApplyNodeStyle(Node* node);
+    void ApplyPinStyle(Pin* pin, PinKind kind);
 
     void RemoveSettings(Object* object);
 
@@ -1428,6 +1454,9 @@ struct EditorContext
 
     ImU32 GetColor(StyleColor colorIndex) const;
     ImU32 GetColor(StyleColor colorIndex, float alpha) const;
+
+    bool ValidateVirtualNode(const VirtualNodeDesc& desc, Node* node) const;
+    void SubmitVirtualPin(Node* node, const ImVec2& origin, const VirtualPinDesc& desc);
 
     int GetNodeIds(NodeId* nodes, int size) const;
 

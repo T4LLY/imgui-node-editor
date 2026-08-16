@@ -104,6 +104,29 @@ ctest --test-dir build-tests-1.92.9b -C Release --output-on-failure
 CI runs this suite against both the bundled ImGui and Dear ImGui 1.92.9b on Windows, Linux,
 and macOS.
 
+### Virtual nodes
+
+Large graphs can keep off-screen nodes live without rebuilding their ImGui contents every frame.
+Cache node-local pin bounds/pivots after a measured full submission, then use `SubmitVirtualNode()`
+for nodes outside the visible canvas. Submit all nodes before links, exactly as with full nodes.
+
+```cpp
+if (ed::IsNodeVisible(nodeId, overscan))
+{
+    ed::BeginNode(nodeId);
+    // Draw contents and pins.
+    ed::EndNode();
+}
+else
+{
+    ed::VirtualNodeDesc node = {/* cached size and node-local pin geometry */};
+    ed::SubmitVirtualNode(node);
+}
+```
+
+`GetNodeBackgroundDrawList()` returns `nullptr` for a virtual node because no node draw channels
+are allocated. Native `Group()` nodes are intentionally not virtualized by this initial API.
+
 ### Quick Start
 
 Main node editor header is located in [imgui_node_editor.h](../imgui_node_editor.h).

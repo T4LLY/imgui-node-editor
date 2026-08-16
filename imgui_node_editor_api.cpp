@@ -148,6 +148,21 @@ void ax::NodeEditor::BeginNode(NodeId id)
     s_Editor->GetNodeBuilder().Begin(id);
 }
 
+bool ax::NodeEditor::SubmitVirtualNode(const VirtualNodeDesc& desc)
+{
+    return s_Editor->SubmitVirtualNode(desc);
+}
+
+bool ax::NodeEditor::IsNodeVisible(NodeId id, float margin)
+{
+    return s_Editor->IsNodeVisible(id, margin);
+}
+
+void ax::NodeEditor::GetVisibleCanvasBounds(ImVec2* min, ImVec2* max)
+{
+    s_Editor->GetVisibleCanvasBounds(min, max);
+}
+
 void ax::NodeEditor::BeginPin(PinId id, PinKind kind)
 {
     s_Editor->GetNodeBuilder().BeginPin(id, kind);

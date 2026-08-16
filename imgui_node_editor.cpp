@@ -19,6 +19,7 @@
 # include <sstream>
 # include <streambuf>
 # include <type_traits>
+# include <cmath>
 
 // https://stackoverflow.com/a/8597498
 # define DECLARE_HAS_NESTED(Name, Member)                                          \
@@ -565,6 +566,9 @@ static void ImDrawList_AddBezierWithArrows(ImDrawList* drawList, const ImCubicBe
 //------------------------------------------------------------------------------
 void ed::Pin::Draw(ImDrawList* drawList, DrawFlags flags)
 {
+    if (!m_Node || !m_Node->IsFullSubmitted())
+        return;
+
     if (flags & Hovered)
     {
         drawList->ChannelsSetCurrent(m_Node->m_Channel + c_NodePinChannel);
@@ -654,6 +658,9 @@ bool ed::Node::EndDrag()
 
 void ed::Node::Draw(ImDrawList* drawList, DrawFlags flags)
 {
+    if (!IsFullSubmitted())
+        return;
+
     if (flags == Detail::Object::None)
     {
         drawList->ChannelsSetCurrent(m_Channel + c_NodeBackgroundChannel);
@@ -1286,7 +1293,7 @@ void ed::EditorContext::End()
 
     // Draw nodes
     for (auto node : m_Nodes)
-        if (node->m_IsLive && node->IsVisible())
+        if (node->m_IsLive && node->IsFullSubmitted() && node->IsVisible())
             node->Draw(m_DrawList);
 
     // Draw links
@@ -1450,17 +1457,20 @@ void ed::EditorContext::End()
     // node drawing order.
     {
         // Copy group nodes
-        auto liveNodeCount = static_cast<int>(std::count_if(m_Nodes.begin(), m_Nodes.end(), [](Node* node) { return node->m_IsLive; }));
+        auto fullNodeCount = static_cast<int>(std::count_if(m_Nodes.begin(), m_Nodes.end(), [](Node* node)
+        {
+            return node->m_IsLive && node->IsFullSubmitted();
+        }));
 
         // Reserve two additional channels for sorted list of channels
         auto nodeChannelCount = m_DrawList->_Splitter._Count;
-        ImDrawList_ChannelsGrow(m_DrawList, m_DrawList->_Splitter._Count + c_ChannelsPerNode * liveNodeCount + c_LinkChannelCount);
+        ImDrawList_ChannelsGrow(m_DrawList, m_DrawList->_Splitter._Count + c_ChannelsPerNode * fullNodeCount + c_LinkChannelCount);
 
         int targetChannel = nodeChannelCount;
 
         auto copyNode = [this, &targetChannel](Node* node)
         {
-            if (!node->m_IsLive)
+            if (!node->m_IsLive || !node->IsFullSubmitted())
                 return;
 
             for (int i = 0; i < c_ChannelsPerNode; ++i)
@@ -1764,6 +1774,190 @@ void ed::EditorContext::UpdateNodeState(Node* node)
     node->m_GroupBounds.Max = node->m_GroupBounds.Min + settings->m_GroupSize;
     node->m_GroupBounds.Min = ImFloor(node->m_GroupBounds.Min);
     node->m_GroupBounds.Max = ImFloor(node->m_GroupBounds.Max);
+}
+
+void ed::EditorContext::PrepareNodeForSubmission(Node* node)
+{
+    UpdateNodeState(node);
+
+    if (!node->m_CenterOnScreen)
+        return;
+
+    auto bounds = GetViewRect();
+    auto offset = bounds.GetCenter() - node->m_Bounds.GetCenter();
+
+    if (ImLengthSqr(offset) > 0)
+    {
+        if (::IsGroup(node))
+        {
+            std::vector<Node*> groupedNodes;
+            node->GetGroupedNodes(groupedNodes);
+            groupedNodes.push_back(node);
+
+            for (auto groupedNode : groupedNodes)
+            {
+                groupedNode->m_Bounds.Translate(ImFloor(offset));
+                groupedNode->m_GroupBounds.Translate(ImFloor(offset));
+                MakeDirty(SaveReasonFlags::Position | SaveReasonFlags::User, groupedNode);
+            }
+        }
+        else
+        {
+            node->m_Bounds.Translate(ImFloor(offset));
+            node->m_GroupBounds.Translate(ImFloor(offset));
+            MakeDirty(SaveReasonFlags::Position | SaveReasonFlags::User, node);
+        }
+    }
+
+    node->m_CenterOnScreen = false;
+}
+
+void ed::EditorContext::ApplyNodeStyle(Node* node)
+{
+    auto& editorStyle = GetStyle();
+    const auto alpha  = ImGui::GetStyle().Alpha;
+
+    node->m_Color            = GetColor(StyleColor_NodeBg, alpha);
+    node->m_BorderColor      = GetColor(StyleColor_NodeBorder, alpha);
+    node->m_BorderWidth      = editorStyle.NodeBorderWidth;
+    node->m_Rounding         = editorStyle.NodeRounding;
+    node->m_GroupColor       = GetColor(StyleColor_GroupBg, alpha);
+    node->m_GroupBorderColor = GetColor(StyleColor_GroupBorder, alpha);
+    node->m_GroupBorderWidth = editorStyle.GroupBorderWidth;
+    node->m_GroupRounding    = editorStyle.GroupRounding;
+    node->m_HighlightConnectedLinks = editorStyle.HighlightConnectedLinks != 0.0f;
+}
+
+void ed::EditorContext::ApplyPinStyle(Pin* pin, PinKind kind)
+{
+    auto& editorStyle = GetStyle();
+
+    pin->m_Color       = GetColor(StyleColor_PinRect);
+    pin->m_BorderColor = GetColor(StyleColor_PinRectBorder);
+    pin->m_BorderWidth = editorStyle.PinBorderWidth;
+    pin->m_Rounding    = editorStyle.PinRounding;
+    pin->m_Corners     = static_cast<int>(editorStyle.PinCorners);
+    pin->m_Radius      = editorStyle.PinRadius;
+    pin->m_ArrowSize   = editorStyle.PinArrowSize;
+    pin->m_ArrowWidth  = editorStyle.PinArrowWidth;
+    pin->m_Dir         = kind == PinKind::Output ? editorStyle.SourceDirection : editorStyle.TargetDirection;
+    pin->m_Strength    = editorStyle.LinkStrength;
+    pin->m_SnapLinkToDir = editorStyle.SnapLinkToPinDir != 0.0f;
+}
+
+static bool IsFiniteVector(const ImVec2& value)
+{
+    return std::isfinite(value.x) && std::isfinite(value.y);
+}
+
+bool ed::EditorContext::ValidateVirtualNode(const VirtualNodeDesc& desc, Node* node) const
+{
+    if (!desc.Id || !IsFiniteVector(desc.Size) || desc.Size.x < 0.0f || desc.Size.y < 0.0f)
+        return false;
+
+    if (desc.PinCount < 0 || (desc.PinCount > 0 && desc.Pins == nullptr))
+        return false;
+
+    if (node && (node->m_Submission != NodeSubmissionKind::None || ::IsGroup(node)))
+        return false;
+
+    for (int i = 0; i < desc.PinCount; ++i)
+    {
+        const auto& pin = desc.Pins[i];
+
+        if (!pin.Id || (pin.Kind != PinKind::Input && pin.Kind != PinKind::Output))
+            return false;
+
+        if (!IsFiniteVector(pin.BoundsMinOffset) || !IsFiniteVector(pin.BoundsMaxOffset) ||
+            !IsFiniteVector(pin.PivotMinOffset) || !IsFiniteVector(pin.PivotMaxOffset))
+            return false;
+
+        if (pin.BoundsMinOffset.x > pin.BoundsMaxOffset.x || pin.BoundsMinOffset.y > pin.BoundsMaxOffset.y ||
+            pin.PivotMinOffset.x > pin.PivotMaxOffset.x || pin.PivotMinOffset.y > pin.PivotMaxOffset.y)
+            return false;
+
+        for (int j = 0; j < i; ++j)
+            if (desc.Pins[j].Id == pin.Id)
+                return false;
+
+        if (auto existing = const_cast<EditorContext*>(this)->FindPin(pin.Id))
+            if (existing->m_IsLive)
+                return false;
+    }
+
+    return true;
+}
+
+void ed::EditorContext::SubmitVirtualPin(Node* node, const ImVec2& origin, const VirtualPinDesc& desc)
+{
+    auto pin = GetPin(desc.Id, desc.Kind);
+
+    pin->m_Node   = node;
+    pin->m_IsLive = true;
+    ApplyPinStyle(pin, desc.Kind);
+
+    pin->m_Bounds.Min = ImFloor(origin + desc.BoundsMinOffset);
+    pin->m_Bounds.Max = ImFloor(origin + desc.BoundsMaxOffset);
+    pin->m_Pivot.Min  = ImFloor(origin + desc.PivotMinOffset);
+    pin->m_Pivot.Max  = ImFloor(origin + desc.PivotMaxOffset);
+
+    pin->m_PreviousPin = node->m_LastPin;
+    node->m_LastPin    = pin;
+}
+
+bool ed::EditorContext::SubmitVirtualNode(const VirtualNodeDesc& desc)
+{
+    if (!m_DrawList || m_NodeBuilder.m_CurrentNode)
+        return false;
+
+    if (!ValidateVirtualNode(desc, nullptr))
+        return false;
+
+    auto node = GetNode(desc.Id);
+    if (!ValidateVirtualNode(desc, node))
+        return false;
+
+    PrepareNodeForSubmission(node);
+
+    node->m_IsLive      = true;
+    node->m_Submission  = NodeSubmissionKind::Virtual;
+    node->m_LastPin     = nullptr;
+    node->m_Type        = NodeType::Node;
+    ApplyNodeStyle(node);
+
+    const ImVec2 size(ImMax(0.0f, desc.Size.x), ImMax(0.0f, desc.Size.y));
+    const ImVec2 measuredSize = ImFloor(size);
+    if (node->m_Bounds.GetSize() != measuredSize)
+    {
+        node->m_Bounds.Max = node->m_Bounds.Min + measuredSize;
+        MakeDirty(SaveReasonFlags::Size, node);
+    }
+
+    const auto origin = node->m_Bounds.Min;
+    for (int i = 0; i < desc.PinCount; ++i)
+        SubmitVirtualPin(node, origin, desc.Pins[i]);
+
+    return true;
+}
+
+bool ed::EditorContext::IsNodeVisible(NodeId id, float margin)
+{
+    auto node = FindNode(id);
+    if (!node || ImRect_IsEmpty(node->m_Bounds))
+        return true;
+
+    auto view = GetViewRect();
+    view.Expand(ImMax(0.0f, margin));
+    return view.Overlaps(node->m_Bounds);
+}
+
+void ed::EditorContext::GetVisibleCanvasBounds(ImVec2* min, ImVec2* max) const
+{
+    const auto& view = GetViewRect();
+    if (min)
+        *min = view.Min;
+    if (max)
+        *max = view.Max;
 }
 
 void ed::EditorContext::RemoveSettings(Object* object)
@@ -5233,58 +5427,19 @@ void ed::NodeBuilder::Begin(NodeId nodeId)
     IM_ASSERT(nullptr == m_CurrentNode);
 
     m_CurrentNode = Editor->GetNode(nodeId);
+    IM_ASSERT(m_CurrentNode->m_Submission == NodeSubmissionKind::None);
 
-    Editor->UpdateNodeState(m_CurrentNode);
-
-    if (m_CurrentNode->m_CenterOnScreen)
-    {
-        auto bounds = Editor->GetViewRect();
-        auto offset = bounds.GetCenter() - m_CurrentNode->m_Bounds.GetCenter();
-
-        if (ImLengthSqr(offset) > 0)
-        {
-            if (::IsGroup(m_CurrentNode))
-            {
-                std::vector<Node*> groupedNodes;
-                m_CurrentNode->GetGroupedNodes(groupedNodes);
-                groupedNodes.push_back(m_CurrentNode);
-
-                for (auto node : groupedNodes)
-                {
-                    node->m_Bounds.Translate(ImFloor(offset));
-                    node->m_GroupBounds.Translate(ImFloor(offset));
-                    Editor->MakeDirty(SaveReasonFlags::Position | SaveReasonFlags::User, node);
-                }
-            }
-            else
-            {
-                m_CurrentNode->m_Bounds.Translate(ImFloor(offset));
-                m_CurrentNode->m_GroupBounds.Translate(ImFloor(offset));
-                Editor->MakeDirty(SaveReasonFlags::Position | SaveReasonFlags::User, m_CurrentNode);
-            }
-        }
-
-        m_CurrentNode->m_CenterOnScreen = false;
-    }
+    Editor->PrepareNodeForSubmission(m_CurrentNode);
 
     // Position node on screen
     ImGui::SetCursorScreenPos(m_CurrentNode->m_Bounds.Min);
 
     auto& editorStyle = Editor->GetStyle();
 
-    const auto alpha = ImGui::GetStyle().Alpha;
-
-    m_CurrentNode->m_IsLive           = true;
-    m_CurrentNode->m_LastPin          = nullptr;
-    m_CurrentNode->m_Color            = Editor->GetColor(StyleColor_NodeBg, alpha);
-    m_CurrentNode->m_BorderColor      = Editor->GetColor(StyleColor_NodeBorder, alpha);
-    m_CurrentNode->m_BorderWidth      = editorStyle.NodeBorderWidth;
-    m_CurrentNode->m_Rounding         = editorStyle.NodeRounding;
-    m_CurrentNode->m_GroupColor       = Editor->GetColor(StyleColor_GroupBg, alpha);
-    m_CurrentNode->m_GroupBorderColor = Editor->GetColor(StyleColor_GroupBorder, alpha);
-    m_CurrentNode->m_GroupBorderWidth = editorStyle.GroupBorderWidth;
-    m_CurrentNode->m_GroupRounding    = editorStyle.GroupRounding;
-    m_CurrentNode->m_HighlightConnectedLinks = editorStyle.HighlightConnectedLinks != 0.0f;
+    m_CurrentNode->m_IsLive     = true;
+    m_CurrentNode->m_Submission = NodeSubmissionKind::Full;
+    m_CurrentNode->m_LastPin    = nullptr;
+    Editor->ApplyNodeStyle(m_CurrentNode);
 
     m_IsGroup = false;
 
@@ -5373,18 +5528,8 @@ void ed::NodeBuilder::BeginPin(PinId pinId, PinKind kind)
     m_CurrentPin = Editor->GetPin(pinId, kind);
     m_CurrentPin->m_Node = m_CurrentNode;
 
-    m_CurrentPin->m_IsLive      = true;
-    m_CurrentPin->m_Color       = Editor->GetColor(StyleColor_PinRect);
-    m_CurrentPin->m_BorderColor = Editor->GetColor(StyleColor_PinRectBorder);
-    m_CurrentPin->m_BorderWidth = editorStyle.PinBorderWidth;
-    m_CurrentPin->m_Rounding    = editorStyle.PinRounding;
-    m_CurrentPin->m_Corners     = static_cast<int>(editorStyle.PinCorners);
-    m_CurrentPin->m_Radius      = editorStyle.PinRadius;
-    m_CurrentPin->m_ArrowSize   = editorStyle.PinArrowSize;
-    m_CurrentPin->m_ArrowWidth  = editorStyle.PinArrowWidth;
-    m_CurrentPin->m_Dir         = kind == PinKind::Output ? editorStyle.SourceDirection : editorStyle.TargetDirection;
-    m_CurrentPin->m_Strength    = editorStyle.LinkStrength;
-    m_CurrentPin->m_SnapLinkToDir = editorStyle.SnapLinkToPinDir != 0.0f;
+    m_CurrentPin->m_IsLive = true;
+    Editor->ApplyPinStyle(m_CurrentPin, kind);
 
     m_CurrentPin->m_PreviousPin = m_CurrentNode->m_LastPin;
     m_CurrentNode->m_LastPin    = m_CurrentPin;
@@ -5508,7 +5653,7 @@ ImDrawList* ed::NodeBuilder::GetUserBackgroundDrawList() const
 
 ImDrawList* ed::NodeBuilder::GetUserBackgroundDrawList(Node* node) const
 {
-    if (node && node->m_IsLive)
+    if (node && node->m_IsLive && node->IsFullSubmitted())
     {
         auto drawList = Editor->GetDrawList();
         drawList->ChannelsSetCurrent(node->m_Channel + c_NodeUserBackgroundChannel);

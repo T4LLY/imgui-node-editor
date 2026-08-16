@@ -373,6 +373,99 @@ void test_repeated_frame_liveness()
     });
 }
 
+void test_virtual_node_submission_keeps_links_and_geometry_alive()
+{
+    Fixture fixture;
+    fixture.frame([] { Fixture::submit_two_nodes(); });
+
+    ed::SetNodePosition(ed::NodeId(1), ImVec2(120.0f, 100.0f));
+    ed::SetNodePosition(ed::NodeId(2), ImVec2(520.0f, 260.0f));
+
+    const ed::VirtualPinDesc source_pin = {
+        ed::PinId(11),
+        ed::PinKind::Output,
+        ImVec2(110.0f, 28.0f),
+        ImVec2(126.0f, 44.0f),
+        ImVec2(118.0f, 32.0f),
+        ImVec2(126.0f, 40.0f),
+    };
+    const ed::VirtualPinDesc target_pin = {
+        ed::PinId(21),
+        ed::PinKind::Input,
+        ImVec2(-6.0f, 28.0f),
+        ImVec2(10.0f, 44.0f),
+        ImVec2(-6.0f, 32.0f),
+        ImVec2(2.0f, 40.0f),
+    };
+
+    const ed::VirtualNodeDesc source = {
+        ed::NodeId(1), ImVec2(120.0f, 72.0f), &source_pin, 1,
+    };
+    const ed::VirtualNodeDesc target = {
+        ed::NodeId(2), ImVec2(120.0f, 72.0f), &target_pin, 1,
+    };
+
+    fixture.frame([&] {
+        CHECK(ed::SubmitVirtualNode(source));
+        CHECK(ed::SubmitVirtualNode(target));
+        CHECK(ed::Link(ed::LinkId(100), ed::PinId(11), ed::PinId(21)));
+        CHECK(ed::GetNodeCount() == 2);
+        CHECK(ed::GetNodeBackgroundDrawList(ed::NodeId(1)) == nullptr);
+        CHECK(ed::GetNodeBackgroundDrawList(ed::NodeId(2)) == nullptr);
+
+        ImVec2 visible_min;
+        ImVec2 visible_max;
+        ed::GetVisibleCanvasBounds(&visible_min, &visible_max);
+        CHECK(visible_min.x < visible_max.x);
+        CHECK(visible_min.y < visible_max.y);
+        CHECK(ed::IsNodeVisible(ed::NodeId(1)));
+    });
+
+    CHECK(near(ed::GetNodePosition(ed::NodeId(1)), ImVec2(120.0f, 100.0f)));
+    CHECK(near(ed::GetNodeSize(ed::NodeId(1)), ImVec2(120.0f, 72.0f)));
+
+    ed::PinId start;
+    ed::PinId end;
+    CHECK(ed::GetLinkPins(ed::LinkId(100), &start, &end));
+    CHECK(start == ed::PinId(11));
+    CHECK(end == ed::PinId(21));
+
+    fixture.frame([] {
+        Fixture::submit_two_nodes();
+        CHECK(ed::GetNodeBackgroundDrawList(ed::NodeId(1)) != nullptr);
+    });
+}
+
+void test_virtual_node_validation_is_transactional()
+{
+    Fixture fixture;
+
+    fixture.frame([] {
+        const ed::VirtualNodeDesc negative_size = {
+            ed::NodeId(50), ImVec2(-1.0f, 20.0f), nullptr, 0,
+        };
+        CHECK(!ed::SubmitVirtualNode(negative_size));
+        CHECK(ed::GetNodeCount() == 0);
+
+        const ed::VirtualPinDesc duplicate_pins[] = {
+            {ed::PinId(501), ed::PinKind::Input, ImVec2(0, 0), ImVec2(10, 10), ImVec2(0, 0), ImVec2(4, 4)},
+            {ed::PinId(501), ed::PinKind::Output, ImVec2(10, 0), ImVec2(20, 10), ImVec2(16, 0), ImVec2(20, 4)},
+        };
+        const ed::VirtualNodeDesc duplicate = {
+            ed::NodeId(51), ImVec2(100.0f, 40.0f), duplicate_pins, 2,
+        };
+        CHECK(!ed::SubmitVirtualNode(duplicate));
+        CHECK(ed::GetNodeCount() == 0);
+
+        const ed::VirtualNodeDesc valid = {
+            ed::NodeId(52), ImVec2(100.0f, 40.0f), nullptr, 0,
+        };
+        CHECK(ed::SubmitVirtualNode(valid));
+        CHECK(!ed::SubmitVirtualNode(valid));
+        CHECK(ed::GetNodeCount() == 1);
+    });
+}
+
 } // namespace
 
 int main()
@@ -385,6 +478,8 @@ int main()
     test_settings_restore();
     test_create_api_idle_smoke();
     test_repeated_frame_liveness();
+    test_virtual_node_submission_keeps_links_and_geometry_alive();
+    test_virtual_node_validation_is_transactional();
 
     if (g_failures != 0)
     {

@@ -1,5 +1,11 @@
 v0.9.4 (WIP):
 
+    NEW: Editor: Add lightweight retained virtual-node submission for off-screen nodes.
+
+        New API: SubmitVirtualNode(), IsNodeVisible(), GetVisibleCanvasBounds().
+        Virtual nodes keep node/pin geometry and links live without creating ImGui node contents
+        or allocating per-node draw channels. Native Group() nodes remain full-submission only.
+
     NEW: Tests: Add headless compatibility coverage for editor state and lifecycle APIs.
 
     NEW: CI: Test bundled ImGui and Dear ImGui 1.92.9b on Windows, Linux, and macOS.
