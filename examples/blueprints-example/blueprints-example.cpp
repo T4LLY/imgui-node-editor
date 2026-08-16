@@ -878,7 +878,11 @@ struct Example:
         for (int i = 0; i < linkCount; ++i) ImGui::Text("Link (%p)", selectedLinks[i].AsPointer());
         ImGui::Unindent();
 
+# if !defined(IMGUI_VERSION_NUM) || (IMGUI_VERSION_NUM < 18822)
         if (ImGui::IsKeyPressed(ImGui::GetKeyIndex(ImGuiKey_Z)))
+# else
+        if (ImGui::IsKeyPressed(ImGuiKey_Z))
+# endif
             for (auto& link : m_Links)
                 ed::Flow(link.ID);
 

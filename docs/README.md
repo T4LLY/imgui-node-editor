@@ -49,7 +49,7 @@ Please report issues or questions if something isn't clear.
 
 ## Dependencies
 
- * Vanilla ImGui 1.72+
+ * Vanilla ImGui 1.72+ (tested through 1.92.9b)
  * C++14
 
 ### Dependencies for examples:

@@ -1,5 +1,9 @@
 v0.9.4 (WIP):
 
+    CHANGE: Editor: Support Dear ImGui 1.92.9b without obsolete API shims.
+
+    BUGFIX: Editor: Avoid ImVec2 scalar multiplication operator collision with Dear ImGui 1.92.7+.
+
     NEW: Editor: Add smooth zoom (#266)
 
     BUGFIX: Canvas: Remember index of first command buffer to not miss updating any used (#260)
