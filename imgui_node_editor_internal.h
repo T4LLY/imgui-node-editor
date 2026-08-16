@@ -485,6 +485,8 @@ struct Link final: Object
     float  m_Thickness;
     ImVec2 m_Start;
     ImVec2 m_End;
+    ImCubicBezierPoints m_Curve;
+    ImRect m_Bounds;
 
     Link(EditorContext* editor, LinkId id)
         : Object(editor)
@@ -493,6 +495,10 @@ struct Link final: Object
         , m_EndPin(nullptr)
         , m_Color(IM_COL32_WHITE)
         , m_Thickness(1.0f)
+        , m_Start(0, 0)
+        , m_End(0, 0)
+        , m_Curve{}
+        , m_Bounds()
     {
     }
 
@@ -510,7 +516,7 @@ struct Link final: Object
     virtual bool TestHit(const ImVec2& point, float extraThickness = 0.0f) const override final;
     virtual bool TestHit(const ImRect& rect, bool allowIntersect = true) const override final;
 
-    virtual ImRect GetBounds() const override final;
+    virtual ImRect GetBounds() const override final { return m_IsLive ? m_Bounds : ImRect(); }
 
     virtual Link* AsLink() override final { return this; }
 };
@@ -1360,6 +1366,7 @@ struct EditorContext
     void ApplyNodeStyle(Node* node);
     void ApplyPinStyle(Pin* pin, PinKind kind);
     void RefreshLiveLinkEndpoints();
+    void RebuildVisibleLinks();
 
     void RemoveSettings(Object* object);
 
@@ -1533,6 +1540,7 @@ private:
     vector<ObjectWrapper<Node>> m_Nodes;
     vector<ObjectWrapper<Pin>>  m_Pins;
     vector<ObjectWrapper<Link>> m_Links;
+    vector<Link*>               m_VisibleLinks;
 
     vector<Object*>     m_SelectedObjects;
 

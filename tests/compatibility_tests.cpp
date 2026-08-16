@@ -528,6 +528,68 @@ void test_retained_pin_geometry_translates_with_node()
     CHECK(ed::GetHoveredPin() == ed::PinId(801));
 }
 
+void test_visible_link_candidates_keep_cross_view_links_interactive()
+{
+    Fixture fixture;
+    fixture.frame([] {});
+
+    fixture.frame_at(ImVec2(10.0f, 10.0f), [] {
+        const ed::VirtualPinDesc source_pin = {
+            ed::PinId(9011), ed::PinKind::Output,
+            ImVec2(110.0f, 22.0f), ImVec2(126.0f, 38.0f),
+            ImVec2(118.0f, 26.0f), ImVec2(126.0f, 34.0f),
+        };
+        const ed::VirtualPinDesc target_pin = {
+            ed::PinId(9021), ed::PinKind::Input,
+            ImVec2(-6.0f, 22.0f), ImVec2(10.0f, 38.0f),
+            ImVec2(-6.0f, 26.0f), ImVec2(2.0f, 34.0f),
+        };
+
+        ed::SetNodePosition(ed::NodeId(901), ImVec2(-260.0f, 220.0f));
+        ed::SetNodePosition(ed::NodeId(902), ImVec2(1120.0f, 220.0f));
+        const ed::VirtualNodeDesc source = {ed::NodeId(901), ImVec2(120.0f, 60.0f), &source_pin, 1};
+        const ed::VirtualNodeDesc target = {ed::NodeId(902), ImVec2(120.0f, 60.0f), &target_pin, 1};
+        CHECK(ed::SubmitVirtualNode(source));
+        CHECK(ed::SubmitVirtualNode(target));
+        CHECK(ed::Link(ed::LinkId(900), ed::PinId(9011), ed::PinId(9021)));
+
+        // Populate many links that are entirely outside the clip rect. They
+        // must not interfere with hit testing of the link crossing the view.
+        for (int i = 0; i < 128; ++i)
+        {
+            const auto source_node = ed::NodeId(1000 + i * 2);
+            const auto target_node = ed::NodeId(1001 + i * 2);
+            const auto source_pin_id = ed::PinId(10000 + i * 2);
+            const auto target_pin_id = ed::PinId(10001 + i * 2);
+            const auto link_id = ed::LinkId(10000 + i);
+            const float y = 5000.0f + static_cast<float>(i) * 80.0f;
+
+            ed::SetNodePosition(source_node, ImVec2(100.0f, y));
+            ed::SetNodePosition(target_node, ImVec2(420.0f, y));
+
+            const ed::VirtualPinDesc off_source_pin = {
+                source_pin_id, ed::PinKind::Output,
+                ImVec2(110.0f, 22.0f), ImVec2(126.0f, 38.0f),
+                ImVec2(118.0f, 26.0f), ImVec2(126.0f, 34.0f),
+            };
+            const ed::VirtualPinDesc off_target_pin = {
+                target_pin_id, ed::PinKind::Input,
+                ImVec2(-6.0f, 22.0f), ImVec2(10.0f, 38.0f),
+                ImVec2(-6.0f, 26.0f), ImVec2(2.0f, 34.0f),
+            };
+            const ed::VirtualNodeDesc off_source = {source_node, ImVec2(120.0f, 60.0f), &off_source_pin, 1};
+            const ed::VirtualNodeDesc off_target = {target_node, ImVec2(120.0f, 60.0f), &off_target_pin, 1};
+            CHECK(ed::SubmitVirtualNode(off_source));
+            CHECK(ed::SubmitVirtualNode(off_target));
+            CHECK(ed::Link(link_id, source_pin_id, target_pin_id));
+        }
+
+        ImGui::GetIO().MousePos = ImVec2(500.0f, 250.0f);
+    });
+
+    CHECK(ed::GetHoveredLink() == ed::LinkId(900));
+}
+
 } // namespace
 
 int main()
@@ -544,6 +606,7 @@ int main()
     test_virtual_node_validation_is_transactional();
     test_virtual_pin_interaction_uses_retained_bounds();
     test_retained_pin_geometry_translates_with_node();
+    test_visible_link_candidates_keep_cross_view_links_interactive();
 
     if (g_failures != 0)
     {

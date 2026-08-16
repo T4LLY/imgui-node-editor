@@ -307,3 +307,11 @@ v0.9.1 (2022-08-27):
     BUGFIX: Editor: Cycle canvas to correctly restore view on first frame (#159)
 
     BUGFIX: Editor: Don't relay on ImGui CursorMaxPos to apply padding (https://github.com/ocornut/imgui/issues/5548)
+
+Phase 6 large-graph link optimizations:
+
+    PERF: Cache live link Bezier geometry and bounds once per submission/update.
+
+    PERF: Build one per-frame visible-link list and reuse it for drawing,
+          hover hit-testing and adjacent-link highlights.
+          Off-screen links no longer repeat Bezier bounds work in each subsystem.

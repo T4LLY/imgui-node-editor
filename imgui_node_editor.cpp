@@ -987,10 +987,7 @@ void ed::Link::UpdateEndpoints()
     const auto line = m_StartPin->GetClosestLine(m_EndPin);
     m_Start = line.A;
     m_End   = line.B;
-}
 
-ImCubicBezierPoints ed::Link::GetCurve() const
-{
     auto easeLinkStrength = [](const ImVec2& a, const ImVec2& b, float strength)
     {
         const auto distanceX    = b.x - a.x;
@@ -1009,13 +1006,49 @@ ImCubicBezierPoints ed::Link::GetCurve() const
     const auto           cp0 = m_Start + m_StartPin->m_Dir * startStrength;
     const auto           cp1 =   m_End +   m_EndPin->m_Dir *   endStrength;
 
-    ImCubicBezierPoints result;
-    result.P0 = m_Start;
-    result.P1 = cp0;
-    result.P2 = cp1;
-    result.P3 = m_End;
+    m_Curve.P0 = m_Start;
+    m_Curve.P1 = cp0;
+    m_Curve.P2 = cp1;
+    m_Curve.P3 = m_End;
 
-    return result;
+    m_Bounds = ImCubicBezierBoundingRect(m_Curve.P0, m_Curve.P1, m_Curve.P2, m_Curve.P3);
+
+    if (m_Bounds.GetWidth() == 0.0f)
+    {
+        m_Bounds.Min.x -= 0.5f;
+        m_Bounds.Max.x += 0.5f;
+    }
+
+    if (m_Bounds.GetHeight() == 0.0f)
+    {
+        m_Bounds.Min.y -= 0.5f;
+        m_Bounds.Max.y += 0.5f;
+    }
+
+    if (m_StartPin->m_ArrowSize)
+    {
+        const auto startDir = ImNormalized(ImCubicBezierTangent(m_Curve.P0, m_Curve.P1, m_Curve.P2, m_Curve.P3, 0.0f));
+        const auto p0 = m_Curve.P0;
+        const auto p1 = m_Curve.P0 - startDir * m_StartPin->m_ArrowSize;
+        const auto min = ImMin(p0, p1);
+        const auto max = ImMax(p0, p1);
+        m_Bounds.Add(ImRect(min, ImMax(max, min + ImVec2(1, 1))));
+    }
+
+    if (m_EndPin->m_ArrowSize)
+    {
+        const auto endDir = ImNormalized(ImCubicBezierTangent(m_Curve.P0, m_Curve.P1, m_Curve.P2, m_Curve.P3, 1.0f));
+        const auto p0 = m_Curve.P3;
+        const auto p1 = m_Curve.P3 + endDir * m_EndPin->m_ArrowSize;
+        const auto min = ImMin(p0, p1);
+        const auto max = ImMax(p0, p1);
+        m_Bounds.Add(ImRect(min, ImMax(max, min + ImVec2(1, 1))));
+    }
+}
+
+ImCubicBezierPoints ed::Link::GetCurve() const
+{
+    return m_Curve;
 }
 
 bool ed::Link::TestHit(const ImVec2& point, float extraThickness) const
@@ -1023,15 +1056,14 @@ bool ed::Link::TestHit(const ImVec2& point, float extraThickness) const
     if (!m_IsLive)
         return false;
 
-    auto bounds = GetBounds();
+    auto bounds = m_Bounds;
     if (extraThickness > 0.0f)
         bounds.Expand(extraThickness);
 
     if (!bounds.Contains(point))
         return false;
 
-    const auto bezier = GetCurve();
-    const auto result = ImProjectOnCubicBezier(point, bezier.P0, bezier.P1, bezier.P2, bezier.P3, 50);
+    const auto result = ImProjectOnCubicBezier(point, m_Curve.P0, m_Curve.P1, m_Curve.P2, m_Curve.P3, 50);
 
     return result.Distance <= m_Thickness + extraThickness;
 }
@@ -1041,80 +1073,28 @@ bool ed::Link::TestHit(const ImRect& rect, bool allowIntersect) const
     if (!m_IsLive)
         return false;
 
-    const auto bounds = GetBounds();
-
-    if (rect.Contains(bounds))
+    if (rect.Contains(m_Bounds))
         return true;
 
-    if (!allowIntersect || !rect.Overlaps(bounds))
+    if (!allowIntersect || !rect.Overlaps(m_Bounds))
         return false;
-
-    const auto bezier = GetCurve();
 
     const auto p0 = rect.GetTL();
     const auto p1 = rect.GetTR();
     const auto p2 = rect.GetBR();
     const auto p3 = rect.GetBL();
 
-    if (ImCubicBezierLineIntersect(bezier.P0, bezier.P1, bezier.P2, bezier.P3, p0, p1).Count > 0)
+    if (ImCubicBezierLineIntersect(m_Curve.P0, m_Curve.P1, m_Curve.P2, m_Curve.P3, p0, p1).Count > 0)
         return true;
-    if (ImCubicBezierLineIntersect(bezier.P0, bezier.P1, bezier.P2, bezier.P3, p1, p2).Count > 0)
+    if (ImCubicBezierLineIntersect(m_Curve.P0, m_Curve.P1, m_Curve.P2, m_Curve.P3, p1, p2).Count > 0)
         return true;
-    if (ImCubicBezierLineIntersect(bezier.P0, bezier.P1, bezier.P2, bezier.P3, p2, p3).Count > 0)
+    if (ImCubicBezierLineIntersect(m_Curve.P0, m_Curve.P1, m_Curve.P2, m_Curve.P3, p2, p3).Count > 0)
         return true;
-    if (ImCubicBezierLineIntersect(bezier.P0, bezier.P1, bezier.P2, bezier.P3, p3, p0).Count > 0)
+    if (ImCubicBezierLineIntersect(m_Curve.P0, m_Curve.P1, m_Curve.P2, m_Curve.P3, p3, p0).Count > 0)
         return true;
 
     return false;
 }
-
-ImRect ed::Link::GetBounds() const
-{
-    if (m_IsLive)
-    {
-        const auto curve = GetCurve();
-        auto bounds = ImCubicBezierBoundingRect(curve.P0, curve.P1, curve.P2, curve.P3);
-
-        if (bounds.GetWidth() == 0.0f)
-        {
-            bounds.Min.x -= 0.5f;
-            bounds.Max.x += 0.5f;
-        }
-
-        if (bounds.GetHeight() == 0.0f)
-        {
-            bounds.Min.y -= 0.5f;
-            bounds.Max.y += 0.5f;
-        }
-
-        if (m_StartPin->m_ArrowSize)
-        {
-            const auto start_dir = ImNormalized(ImCubicBezierTangent(curve.P0, curve.P1, curve.P2, curve.P3, 0.0f));
-            const auto p0 = curve.P0;
-            const auto p1 = curve.P0 - start_dir * m_StartPin->m_ArrowSize;
-            const auto min = ImMin(p0, p1);
-            const auto max = ImMax(p0, p1);
-            auto arrowBounds = ImRect(min, ImMax(max, min + ImVec2(1, 1)));
-            bounds.Add(arrowBounds);
-        }
-
-        if (m_EndPin->m_ArrowSize)
-        {
-            const auto end_dir = ImNormalized(ImCubicBezierTangent(curve.P0, curve.P1, curve.P2, curve.P3, 1.0f));
-            const auto p0 = curve.P3;
-            const auto p1 = curve.P3 + end_dir * m_EndPin->m_ArrowSize;
-            const auto min = ImMin(p0, p1);
-            const auto max = ImMax(p0, p1);
-            auto arrowBounds = ImRect(min, ImMax(max, min + ImVec2(1, 1)));
-            bounds.Add(arrowBounds);
-        }
-
-        return bounds;
-    }
-    else
-        return ImRect();
-}
-
 
 
 
@@ -1135,6 +1115,7 @@ ed::EditorContext::EditorContext(const ax::NodeEditor::Config* config)
     , m_Nodes()
     , m_Pins()
     , m_Links()
+    , m_VisibleLinks()
     , m_SelectionId(1)
     , m_LastActiveLink(nullptr)
     , m_LastControlActiveObject(nullptr)
@@ -1312,6 +1293,8 @@ void ed::EditorContext::Begin(const char* id, const ImVec2& size)
 
 void ed::EditorContext::End()
 {
+    RebuildVisibleLinks();
+
     //auto& io          = ImGui::GetIO();
     auto  control     = BuildControl(m_CurrentAction && m_CurrentAction->IsDragging()); // NavigateAction.IsMovingOverEdge()
     //auto& editorStyle = GetStyle();
@@ -1339,10 +1322,9 @@ void ed::EditorContext::End()
         if (node->m_IsLive && node->IsFullSubmitted() && node->IsVisible())
             node->Draw(m_DrawList);
 
-    // Draw links
-    for (auto link : m_Links)
-        if (link->m_IsLive && link->IsVisible())
-            link->Draw(m_DrawList);
+    // Draw only links whose cached curve bounds overlap the current clip rect.
+    for (auto link : m_VisibleLinks)
+        link->Draw(m_DrawList);
 
     // Highlight selected objects
     {
@@ -1362,11 +1344,8 @@ void ed::EditorContext::End()
             return pin.m_Node->m_HighlightConnectedLinks && pin.m_Node->m_IsSelected;
         };
 
-        for (auto& link : m_Links)
+        for (auto link : m_VisibleLinks)
         {
-            if (!link->m_IsLive || !link->IsVisible())
-                continue;
-
             auto isLinkHighlighted = isLinkHighlightedForPin(*link->m_StartPin) || isLinkHighlightedForPin(*link->m_EndPin);
             if (!isLinkHighlighted)
                 continue;
@@ -1894,6 +1873,23 @@ void ed::EditorContext::RefreshLiveLinkEndpoints()
             link->UpdateEndpoints();
 }
 
+void ed::EditorContext::RebuildVisibleLinks()
+{
+    m_VisibleLinks.clear();
+    m_VisibleLinks.reserve(m_Links.size());
+
+    for (auto link : m_Links)
+    {
+        if (!link->m_IsLive)
+            continue;
+
+        auto bounds = link->GetBounds();
+        bounds.Expand(c_LinkSelectThickness);
+        if (ImGui::IsRectVisible(bounds.Min, bounds.Max))
+            m_VisibleLinks.push_back(link);
+    }
+}
+
 static bool IsFiniteVector(const ImVec2& value)
 {
     return std::isfinite(value.x) && std::isfinite(value.y);
@@ -2122,6 +2118,9 @@ void ed::EditorContext::FindLinksInRect(const ImRect& r, vector<Link*>& result, 
     if (ImRect_IsEmpty(r))
         return;
 
+    // Selection rectangles may extend outside the current clip rect while
+    // dragging, so preserve full-scene behavior here. Cached link geometry
+    // still avoids recomputing Bezier bounds for every candidate.
     for (auto link : m_Links)
         if (link->TestHit(r))
             result.push_back(link);
@@ -2479,7 +2478,7 @@ void ed::EditorContext::MakeDirty(SaveReasonFlags reason, Node* node)
 
 ed::Link* ed::EditorContext::FindLinkAt(const ImVec2& p)
 {
-    for (auto& link : m_Links)
+    for (auto link : m_VisibleLinks)
         if (link->TestHit(p, c_LinkSelectThickness))
             return link;
 
