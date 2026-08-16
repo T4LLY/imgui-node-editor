@@ -6,6 +6,12 @@ v0.9.4 (WIP):
         Virtual nodes keep node/pin geometry and links live without creating ImGui node contents
         or allocating per-node draw channels. Native Group() nodes remain full-submission only.
 
+    PERF: Editor: Cull node and pin interaction items using retained interaction bounds.
+
+        Only cursor candidates and active drag/size targets emit ImGui interaction items.
+        Retained pin geometry now follows node movement so virtual nodes remain interactive and links
+        keep coherent endpoints while selected nodes are dragged.
+
     NEW: Tests: Add headless compatibility coverage for editor state and lifecycle APIs.
 
     NEW: CI: Test bundled ImGui and Dear ImGui 1.92.9b on Windows, Linux, and macOS.

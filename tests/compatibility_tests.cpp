@@ -131,10 +131,15 @@ public:
 
     void frame(const std::function<void()>& contents)
     {
+        frame_at(ImVec2(-1000.0f, -1000.0f), contents);
+    }
+
+    void frame_at(const ImVec2& mouse_pos, const std::function<void()>& contents)
+    {
         auto& io       = ImGui::GetIO();
         io.DisplaySize = ImVec2(1024.0f, 768.0f);
         io.DeltaTime   = 1.0f / 60.0f;
-        io.MousePos    = ImVec2(-1000.0f, -1000.0f);
+        io.MousePos    = mouse_pos;
 
         ImGui::NewFrame();
         ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
@@ -466,6 +471,63 @@ void test_virtual_node_validation_is_transactional()
     });
 }
 
+void test_virtual_pin_interaction_uses_retained_bounds()
+{
+    Fixture fixture;
+    fixture.frame([] {});
+
+    ed::SetNodePosition(ed::NodeId(70), ImVec2(200.0f, 150.0f));
+
+    const ed::VirtualPinDesc pin = {
+        ed::PinId(701),
+        ed::PinKind::Output,
+        ImVec2(110.0f, 20.0f),
+        ImVec2(130.0f, 40.0f),
+        ImVec2(118.0f, 24.0f),
+        ImVec2(130.0f, 36.0f),
+    };
+    const ed::VirtualNodeDesc node = {
+        ed::NodeId(70), ImVec2(100.0f, 60.0f), &pin, 1,
+    };
+
+    fixture.frame_at(ImVec2(10.0f, 10.0f), [&] {
+        ImGui::GetIO().MousePos = ImVec2(320.0f, 180.0f);
+        CHECK(ed::SubmitVirtualNode(node));
+    });
+
+    CHECK(ed::GetHoveredNode() == ed::NodeId(70));
+    CHECK(ed::GetHoveredPin() == ed::PinId(701));
+}
+
+void test_retained_pin_geometry_translates_with_node()
+{
+    Fixture fixture;
+    fixture.frame([] {});
+
+    ed::SetNodePosition(ed::NodeId(80), ImVec2(100.0f, 90.0f));
+    const ed::VirtualPinDesc pin = {
+        ed::PinId(801),
+        ed::PinKind::Input,
+        ImVec2(-8.0f, 18.0f),
+        ImVec2(8.0f, 34.0f),
+        ImVec2(-8.0f, 22.0f),
+        ImVec2(0.0f, 30.0f),
+    };
+    const ed::VirtualNodeDesc node = {
+        ed::NodeId(80), ImVec2(120.0f, 64.0f), &pin, 1,
+    };
+
+    const ImVec2 moved_position(260.0f, 210.0f);
+    fixture.frame_at(ImVec2(10.0f, 10.0f), [&] {
+        CHECK(ed::SubmitVirtualNode(node));
+        ed::SetNodePosition(ed::NodeId(80), moved_position);
+        ImGui::GetIO().MousePos = ImVec2(moved_position.x, moved_position.y + 26.0f);
+    });
+
+    CHECK(ed::GetHoveredNode() == ed::NodeId(80));
+    CHECK(ed::GetHoveredPin() == ed::PinId(801));
+}
+
 } // namespace
 
 int main()
@@ -480,6 +542,8 @@ int main()
     test_repeated_frame_liveness();
     test_virtual_node_submission_keeps_links_and_geometry_alive();
     test_virtual_node_validation_is_transactional();
+    test_virtual_pin_interaction_uses_retained_bounds();
+    test_retained_pin_geometry_translates_with_node();
 
     if (g_failures != 0)
     {

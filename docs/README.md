@@ -127,6 +127,10 @@ else
 `GetNodeBackgroundDrawList()` returns `nullptr` for a virtual node because no node draw channels
 are allocated. Native `Group()` nodes are intentionally not virtualized by this initial API.
 
+Interaction hit testing remains geometry-driven: the editor scans retained node bounds, but only the
+cursor candidate and active drag/size target emit ImGui interaction items. Retained pin bounds and
+pivots move with their node, so selected virtual nodes can move without rebuilding their contents.
+
 ### Quick Start
 
 Main node editor header is located in [imgui_node_editor.h](../imgui_node_editor.h).

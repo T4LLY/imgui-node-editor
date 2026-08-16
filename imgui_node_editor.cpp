@@ -644,11 +644,50 @@ bool ed::Node::AcceptDrag()
     return true;
 }
 
+void ed::Node::UpdateInteractionBounds()
+{
+    m_InteractionBounds = m_Bounds;
+
+    if (m_Type == NodeType::Group && !ImRect_IsEmpty(m_GroupBounds))
+        m_InteractionBounds.Add(m_GroupBounds);
+
+    for (auto pin = m_LastPin; pin; pin = pin->m_PreviousPin)
+    {
+        if (!pin->m_IsLive)
+            continue;
+
+        if (!ImRect_IsEmpty(pin->m_Bounds))
+            m_InteractionBounds.Add(pin->m_Bounds);
+        if (!ImRect_IsEmpty(pin->m_Pivot))
+            m_InteractionBounds.Add(pin->m_Pivot);
+    }
+}
+
+void ed::Node::TranslateGeometry(const ImVec2& delta)
+{
+    if (delta.x == 0.0f && delta.y == 0.0f)
+        return;
+
+    m_Bounds.Translate(delta);
+    if (!ImRect_IsEmpty(m_GroupBounds))
+        m_GroupBounds.Translate(delta);
+    if (!ImRect_IsEmpty(m_InteractionBounds))
+        m_InteractionBounds.Translate(delta);
+
+    for (auto pin = m_LastPin; pin; pin = pin->m_PreviousPin)
+    {
+        if (!pin->m_IsLive)
+            continue;
+
+        pin->m_Bounds.Translate(delta);
+        pin->m_Pivot.Translate(delta);
+    }
+}
+
 void ed::Node::UpdateDrag(const ImVec2& offset)
 {
-    auto size = m_Bounds.GetSize();
-    m_Bounds.Min = ImFloor(m_DragStart + offset);
-    m_Bounds.Max = m_Bounds.Min + size;
+    const auto target = ImFloor(m_DragStart + offset);
+    TranslateGeometry(target - m_Bounds.Min);
 }
 
 bool ed::Node::EndDrag()
@@ -1098,6 +1137,7 @@ ed::EditorContext::EditorContext(const ax::NodeEditor::Config* config)
     , m_Links()
     , m_SelectionId(1)
     , m_LastActiveLink(nullptr)
+    , m_LastControlActiveObject(nullptr)
     , m_Canvas()
     , m_IsCanvasVisible(false)
     , m_NodeBuilder(this)
@@ -1164,6 +1204,9 @@ void ed::EditorContext::Begin(const char* id, const ImVec2& size)
 
     //ImGui::LogToClipboard();
     //Log("---- begin ----");
+
+    if (m_LastControlActiveObject && m_LastControlActiveObject->m_DeleteOnNewFrame)
+        m_LastControlActiveObject = nullptr;
 
     static auto resetAndCollect = [](auto& objects)
     {
@@ -1667,9 +1710,8 @@ void ed::EditorContext::SetNodePosition(NodeId nodeId, const ImVec2& position)
 
     if (node->m_Bounds.Min != position)
     {
-        node->m_Bounds.Translate(position - node->m_Bounds.Min);
-        node->m_Bounds.Min = ImFloor(node->m_Bounds.Min);
-        node->m_Bounds.Max = ImFloor(node->m_Bounds.Max);
+        const auto target = ImFloor(position);
+        node->TranslateGeometry(target - node->m_Bounds.Min);
         MakeDirty(NodeEditor::SaveReasonFlags::Position, node);
     }
 }
@@ -1845,6 +1887,13 @@ void ed::EditorContext::ApplyPinStyle(Pin* pin, PinKind kind)
     pin->m_SnapLinkToDir = editorStyle.SnapLinkToPinDir != 0.0f;
 }
 
+void ed::EditorContext::RefreshLiveLinkEndpoints()
+{
+    for (auto link : m_Links)
+        if (link->m_IsLive)
+            link->UpdateEndpoints();
+}
+
 static bool IsFiniteVector(const ImVec2& value)
 {
     return std::isfinite(value.x) && std::isfinite(value.y);
@@ -1936,6 +1985,8 @@ bool ed::EditorContext::SubmitVirtualNode(const VirtualNodeDesc& desc)
     const auto origin = node->m_Bounds.Min;
     for (int i = 0; i < desc.PinCount; ++i)
         SubmitVirtualPin(node, origin, desc.Pins[i]);
+
+    node->UpdateInteractionBounds();
 
     return true;
 }
@@ -2631,12 +2682,47 @@ ed::Control ed::EditorContext::BuildControl(bool allowOffscreen)
             activeObject = object;
     };
 
-    // Process live nodes and pins.
+    auto objectBelongsToNode = [](Object* object, Node* node)
+    {
+        if (!object)
+            return false;
+        if (object == node)
+            return true;
+        if (auto pin = object->AsPin())
+            return pin->m_Node == node;
+        return false;
+    };
+
+    auto needsInteractionSubmission = [this, mousePos, &objectBelongsToNode](Node* node)
+    {
+        if (node->m_InteractionBounds.Contains(mousePos))
+            return true;
+
+        if (objectBelongsToNode(m_LastControlActiveObject, node))
+            return true;
+
+        if (m_CurrentAction)
+        {
+            if (auto drag = m_CurrentAction->AsDrag())
+                if (objectBelongsToNode(drag->m_DraggedObject, node))
+                    return true;
+
+            if (auto size = m_CurrentAction->AsSize())
+                if (size->m_SizedNode == node)
+                    return true;
+        }
+
+        return false;
+    };
+
+    // Process live nodes and pins. Geometry checks stay O(N), but only the
+    // node under the cursor (or an active drag/size target) emits ImGui items.
     for (auto nodeIt = m_Nodes.rbegin(), nodeItEnd = m_Nodes.rend(); nodeIt != nodeItEnd; ++nodeIt)
     {
         auto node = *nodeIt;
 
         if (!node->m_IsLive) continue;
+        if (!needsInteractionSubmission(node)) continue;
 
         // Check for interactions with live pins in node before
         // processing node itself. Pins does not overlap each other
@@ -2761,6 +2847,8 @@ ed::Control ed::EditorContext::BuildControl(bool allowOffscreen)
 
     if (activeId)
         m_EditorActiveId = activeId;
+
+    m_LastControlActiveObject = activeObject;
 
     if (ImGui::IsAnyItemActive() && ImGui::GetActiveID() != m_EditorActiveId)
         return Control();
@@ -4223,6 +4311,8 @@ bool ed::DragAction::Process(const Control& control)
 
         for (auto object : m_Objects)
             object->UpdateDrag(dragOffset);
+
+        Editor->RefreshLiveLinkEndpoints();
     }
     else if (!control.ActiveObject)
     {
@@ -5513,6 +5603,8 @@ void ed::NodeBuilder::End()
     }
     else
         m_CurrentNode->m_Type        = NodeType::Node;
+
+    m_CurrentNode->UpdateInteractionBounds();
 
     m_CurrentNode = nullptr;
 }

@@ -391,6 +391,7 @@ struct Node final: Object
     NodeId   m_ID;
     NodeType m_Type;
     ImRect   m_Bounds;
+    ImRect   m_InteractionBounds;
     float    m_ZPosition;
     int      m_Channel;
     Pin*     m_LastPin;
@@ -418,6 +419,7 @@ struct Node final: Object
         , m_ID(id)
         , m_Type(NodeType::Node)
         , m_Bounds()
+        , m_InteractionBounds()
         , m_ZPosition(0.0f)
         , m_Channel(0)
         , m_LastPin(nullptr)
@@ -443,6 +445,9 @@ struct Node final: Object
 
     bool IsFullSubmitted() const { return m_Submission == NodeSubmissionKind::Full; }
     bool IsVirtualSubmitted() const { return m_Submission == NodeSubmissionKind::Virtual; }
+
+    void UpdateInteractionBounds();
+    void TranslateGeometry(const ImVec2& delta);
 
     virtual ObjectId ID() override { return m_ID; }
 
@@ -1354,6 +1359,7 @@ struct EditorContext
     void PrepareNodeForSubmission(Node* node);
     void ApplyNodeStyle(Node* node);
     void ApplyPinStyle(Pin* pin, PinKind kind);
+    void RefreshLiveLinkEndpoints();
 
     void RemoveSettings(Object* object);
 
@@ -1534,6 +1540,7 @@ private:
     uint64_t            m_SelectionId;
 
     Link*               m_LastActiveLink;
+    Object*             m_LastControlActiveObject;
 
     vector<Animation*>  m_LiveAnimations;
     vector<Animation*>  m_LastLiveAnimations;
