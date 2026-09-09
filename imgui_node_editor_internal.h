@@ -314,6 +314,7 @@ struct Pin final: Object
     bool    m_SnapLinkToDir;
     bool    m_HasConnection;
     bool    m_HadConnection;
+    uint64_t m_GeometryRevision;
 
     Pin(EditorContext* editor, PinId id, PinKind kind)
         : Object(editor)
@@ -335,10 +336,18 @@ struct Pin final: Object
         , m_SnapLinkToDir(true)
         , m_HasConnection(false)
         , m_HadConnection(false)
+        , m_GeometryRevision(1)
     {
     }
 
     virtual ObjectId ID() override { return m_ID; }
+
+    void MarkGeometryDirty()
+    {
+        ++m_GeometryRevision;
+        if (m_GeometryRevision == 0)
+            ++m_GeometryRevision;
+    }
 
     virtual void Reset() override final
     {
@@ -495,6 +504,9 @@ struct Link final: Object
     ImVec2 m_End;
     ImCubicBezierPoints m_Curve;
     ImRect m_Bounds;
+    uint64_t m_StartGeometryRevision;
+    uint64_t m_EndGeometryRevision;
+    bool     m_GeometryValid;
 
     Link(EditorContext* editor, LinkId id)
         : Object(editor)
@@ -507,6 +519,9 @@ struct Link final: Object
         , m_End(0, 0)
         , m_Curve{}
         , m_Bounds()
+        , m_StartGeometryRevision(0)
+        , m_EndGeometryRevision(0)
+        , m_GeometryValid(false)
     {
     }
 

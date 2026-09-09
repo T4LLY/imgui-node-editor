@@ -768,6 +768,7 @@ void ed::Node::TranslateGeometry(const ImVec2& delta)
 
         pin->m_Bounds.Translate(delta);
         pin->m_Pivot.Translate(delta);
+        pin->MarkGeometryDirty();
     }
 
     Editor->MarkNodeSpatialIndexDirty();
@@ -1085,6 +1086,11 @@ void ed::Link::Draw(ImDrawList* drawList, ImU32 color, float extraThickness) con
 
 void ed::Link::UpdateEndpoints()
 {
+    if (m_GeometryValid
+        && m_StartGeometryRevision == m_StartPin->m_GeometryRevision
+        && m_EndGeometryRevision == m_EndPin->m_GeometryRevision)
+        return;
+
     const auto previousBounds = m_Bounds;
     const auto line = m_StartPin->GetClosestLine(m_EndPin);
     m_Start = line.A;
@@ -1146,6 +1152,10 @@ void ed::Link::UpdateEndpoints()
         const auto max = ImMax(p0, p1);
         m_Bounds.Add(ImRect(min, ImMax(max, min + ImVec2(1, 1))));
     }
+
+    m_StartGeometryRevision = m_StartPin->m_GeometryRevision;
+    m_EndGeometryRevision   = m_EndPin->m_GeometryRevision;
+    m_GeometryValid         = true;
 
     if (previousBounds.Min != m_Bounds.Min || previousBounds.Max != m_Bounds.Max)
         Editor->MarkLinkSpatialIndexDirty();
@@ -1817,6 +1827,9 @@ bool ed::EditorContext::DoLink(LinkId id, PinId startPinId, PinId endPinId, ImU3
     if (link->m_IsLive)
         UnregisterLinkAdjacency(link);
 
+    if (link->m_StartPin != startPin || link->m_EndPin != endPin)
+        link->m_GeometryValid = false;
+
     link->m_StartPin       = startPin;
     link->m_EndPin         = endPin;
     link->m_Color          = color;
@@ -2007,6 +2020,13 @@ void ed::EditorContext::ApplyNodeStyle(Node* node)
 void ed::EditorContext::ApplyPinStyle(Pin* pin, PinKind kind)
 {
     auto& editorStyle = GetStyle();
+    const auto direction = kind == PinKind::Output ? editorStyle.SourceDirection : editorStyle.TargetDirection;
+    const auto snapToDir = editorStyle.SnapLinkToPinDir != 0.0f;
+    const bool geometryChanged = pin->m_Radius != editorStyle.PinRadius
+        || pin->m_ArrowSize != editorStyle.PinArrowSize
+        || pin->m_Dir != direction
+        || pin->m_Strength != editorStyle.LinkStrength
+        || pin->m_SnapLinkToDir != snapToDir;
 
     pin->m_Color       = GetColor(StyleColor_PinRect);
     pin->m_BorderColor = GetColor(StyleColor_PinRectBorder);
@@ -2016,9 +2036,12 @@ void ed::EditorContext::ApplyPinStyle(Pin* pin, PinKind kind)
     pin->m_Radius      = editorStyle.PinRadius;
     pin->m_ArrowSize   = editorStyle.PinArrowSize;
     pin->m_ArrowWidth  = editorStyle.PinArrowWidth;
-    pin->m_Dir         = kind == PinKind::Output ? editorStyle.SourceDirection : editorStyle.TargetDirection;
+    pin->m_Dir         = direction;
     pin->m_Strength    = editorStyle.LinkStrength;
-    pin->m_SnapLinkToDir = editorStyle.SnapLinkToPinDir != 0.0f;
+    pin->m_SnapLinkToDir = snapToDir;
+
+    if (geometryChanged)
+        pin->MarkGeometryDirty();
 }
 
 uint64_t ed::EditorContext::NextVisitStamp()
@@ -2325,8 +2348,12 @@ void ed::EditorContext::SubmitVirtualPin(Node* node, const ImVec2& origin, const
 
     pin->m_Bounds.Min = ImFloor(origin + desc.BoundsMinOffset);
     pin->m_Bounds.Max = ImFloor(origin + desc.BoundsMaxOffset);
-    pin->m_Pivot.Min  = ImFloor(origin + desc.PivotMinOffset);
-    pin->m_Pivot.Max  = ImFloor(origin + desc.PivotMaxOffset);
+
+    const auto previousPivot = pin->m_Pivot;
+    pin->m_Pivot.Min = ImFloor(origin + desc.PivotMinOffset);
+    pin->m_Pivot.Max = ImFloor(origin + desc.PivotMaxOffset);
+    if (previousPivot.Min != pin->m_Pivot.Min || previousPivot.Max != pin->m_Pivot.Max)
+        pin->MarkGeometryDirty();
 
     pin->m_PreviousPin = node->m_LastPin;
     node->m_LastPin    = pin;
@@ -6018,6 +6045,8 @@ void ed::NodeBuilder::EndPin()
 
     ImGui::EndGroup();
 
+    const auto previousPivot = m_CurrentPin->m_Pivot;
+
     if (m_ResolvePinRect)
         m_CurrentPin->m_Bounds = ImGui_GetItemRect();
 
@@ -6033,6 +6062,9 @@ void ed::NodeBuilder::EndPin()
         m_CurrentPin->m_Pivot.Min = pinRect.Min + ImMul(pinRect.GetSize(), m_PivotAlignment);
         m_CurrentPin->m_Pivot.Max = m_CurrentPin->m_Pivot.Min + ImMul(m_PivotSize, m_PivotScale);
     }
+
+    if (previousPivot.Min != m_CurrentPin->m_Pivot.Min || previousPivot.Max != m_CurrentPin->m_Pivot.Max)
+        m_CurrentPin->MarkGeometryDirty();
 
     // #debug: Draw pin bounds
     //Editor->GetDrawList()->AddRect(m_CurrentPin->m_Bounds.Min, m_CurrentPin->m_Bounds.Max, IM_COL32(255, 255, 0, 255));
@@ -6057,8 +6089,13 @@ void ed::NodeBuilder::PinPivotRect(const ImVec2& a, const ImVec2& b)
 {
     IM_ASSERT(nullptr != m_CurrentPin);
 
-    m_CurrentPin->m_Pivot = ImRect(a, b);
-    m_ResolvePivot      = false;
+    const auto pivot = ImRect(a, b);
+    if (m_CurrentPin->m_Pivot.Min != pivot.Min || m_CurrentPin->m_Pivot.Max != pivot.Max)
+    {
+        m_CurrentPin->m_Pivot = pivot;
+        m_CurrentPin->MarkGeometryDirty();
+    }
+    m_ResolvePivot = false;
 }
 
 void ed::NodeBuilder::PinPivotSize(const ImVec2& size)
