@@ -2655,7 +2655,6 @@ ed::Pin* ed::EditorContext::CreatePin(PinId id, PinKind kind)
     auto pin = new Pin(this, id, kind);
     m_Pins.push_back({id, pin});
     m_PinLookup[id.Get()] = pin;
-    std::sort(m_Pins.begin(), m_Pins.end());
     return pin;
 }
 
@@ -2691,7 +2690,6 @@ ed::Link* ed::EditorContext::CreateLink(LinkId id)
     m_Links.push_back({id, link});
     m_LinkLookup[id.Get()] = link;
     MarkLinkSpatialIndexDirty();
-    std::sort(m_Links.begin(), m_Links.end());
 
     return link;
 }
