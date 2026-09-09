@@ -154,6 +154,13 @@ public:
         contents();
         ed::End();
 
+        // The node editor uses an internal ImDrawCallback sentinel while
+        // transforming canvas draw commands. It must never escape ed::End(),
+        // otherwise render backends may try to invoke it as a function pointer.
+        const auto* draw_list = ImGui::GetWindowDrawList();
+        for (int i = 0; i < draw_list->CmdBuffer.Size; ++i)
+            CHECK(draw_list->CmdBuffer[i].UserCallback == nullptr);
+
         ImGui::End();
         ImGui::EndFrame();
     }

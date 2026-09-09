@@ -561,6 +561,18 @@ void ImGuiEx::Canvas::LeaveLocalSpace()
             m_DrawList->CmdBuffer.erase(m_DrawList->CmdBuffer.Data + m_DrawListCommadBufferSize);
         else if (m_DrawList->CmdBuffer.size() >= m_DrawListCommadBufferSize && m_DrawList->CmdBuffer[m_DrawListCommadBufferSize - 1].UserCallback == ImDrawCallback_ImCanvas)
             m_DrawList->CmdBuffer.erase(m_DrawList->CmdBuffer.Data + m_DrawListCommadBufferSize - 1);
+
+        // Suspend()/Resume() can move the sentinel beyond the command indices
+        // derived from the pre-entry buffer size. Search the local-space range
+        // as a fallback so the renderer never receives the internal sentinel.
+        for (int i = m_DrawListFirstCommandIndex; i < m_DrawList->CmdBuffer.size(); ++i)
+        {
+            if (m_DrawList->CmdBuffer[i].UserCallback == ImDrawCallback_ImCanvas)
+            {
+                m_DrawList->CmdBuffer.erase(m_DrawList->CmdBuffer.Data + i);
+                break;
+            }
+        }
     }
 
     auto& fringeScale = ImFringeScaleRef(m_DrawList);
