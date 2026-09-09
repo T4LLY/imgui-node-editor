@@ -222,14 +222,14 @@ struct Object
 
     EditorContext* const Editor;
 
-    bool     m_IsLive;
+    uint64_t m_LiveGeneration;
     bool     m_IsSelected;
     bool     m_DeleteOnNewFrame;
     uint64_t m_VisitStamp;
 
     Object(EditorContext* editor)
         : Editor(editor)
-        , m_IsLive(true)
+        , m_LiveGeneration(0)
         , m_IsSelected(false)
         , m_DeleteOnNewFrame(false)
         , m_VisitStamp(0)
@@ -238,11 +238,15 @@ struct Object
 
     virtual ~Object() = default;
 
+    bool IsLive() const;
+    bool WasLivePreviousFrame() const;
+    void MarkLive();
+
     virtual ObjectId ID() = 0;
 
     bool IsVisible() const
     {
-        if (!m_IsLive)
+        if (!IsLive())
             return false;
 
         const auto bounds = GetBounds();
@@ -250,7 +254,7 @@ struct Object
         return ImGui::IsRectVisible(bounds.Min, bounds.Max);
     }
 
-    virtual void Reset() { m_IsLive = false; }
+    virtual void Reset() { m_LiveGeneration = 0; }
 
     virtual void Draw(ImDrawList* drawList, DrawFlags flags = None) = 0;
 
@@ -264,7 +268,7 @@ struct Object
 
     virtual bool TestHit(const ImVec2& point, float extraThickness = 0.0f) const
     {
-        if (!m_IsLive)
+        if (!IsLive())
             return false;
 
         auto bounds = GetBounds();
@@ -276,7 +280,7 @@ struct Object
 
     virtual bool TestHit(const ImRect& rect, bool allowIntersect = true) const
     {
-        if (!m_IsLive)
+        if (!IsLive())
             return false;
 
         const auto bounds = GetBounds();
@@ -349,9 +353,19 @@ struct Pin final: Object
             ++m_GeometryRevision;
     }
 
+    void BeginFrame()
+    {
+        if (IsLive())
+            return;
+
+        m_HadConnection = m_HasConnection && WasLivePreviousFrame();
+        m_HasConnection = false;
+        MarkLive();
+    }
+
     virtual void Reset() override final
     {
-        m_HadConnection = m_HasConnection && m_IsLive;
+        m_HadConnection = m_HasConnection && IsLive();
         m_HasConnection = false;
 
         Object::Reset();
@@ -453,6 +467,16 @@ struct Node final: Object
     {
     }
 
+    void BeginFrame()
+    {
+        if (IsLive())
+            return;
+
+        m_Submission = NodeSubmissionKind::None;
+        m_LastPin    = nullptr;
+        MarkLive();
+    }
+
     virtual void Reset() override final
     {
         Object::Reset();
@@ -460,8 +484,8 @@ struct Node final: Object
         m_LastPin    = nullptr;
     }
 
-    bool IsFullSubmitted() const { return m_Submission == NodeSubmissionKind::Full; }
-    bool IsVirtualSubmitted() const { return m_Submission == NodeSubmissionKind::Virtual; }
+    bool IsFullSubmitted() const { return IsLive() && m_Submission == NodeSubmissionKind::Full; }
+    bool IsVirtualSubmitted() const { return IsLive() && m_Submission == NodeSubmissionKind::Virtual; }
 
     void UpdateInteractionBounds();
     void TranslateGeometry(const ImVec2& delta);
@@ -539,7 +563,7 @@ struct Link final: Object
     virtual bool TestHit(const ImVec2& point, float extraThickness = 0.0f) const override final;
     virtual bool TestHit(const ImRect& rect, bool allowIntersect = true) const override final;
 
-    virtual ImRect GetBounds() const override final { return m_IsLive ? m_Bounds : ImRect(); }
+    virtual ImRect GetBounds() const override final { return IsLive() ? m_Bounds : ImRect(); }
 
     virtual Link* AsLink() override final { return this; }
 };
@@ -1355,6 +1379,12 @@ inline SuspendFlags operator |(SuspendFlags lhs, SuspendFlags rhs) { return stat
 inline SuspendFlags operator &(SuspendFlags lhs, SuspendFlags rhs) { return static_cast<SuspendFlags>(static_cast<uint8_t>(lhs) & static_cast<uint8_t>(rhs)); }
 
 
+struct LinkAdjacencyEntry
+{
+    uint64_t m_Generation = 0;
+    vector<Link*> m_Links;
+};
+
 struct EditorContext
 {
     EditorContext(const ax::NodeEditor::Config* config = nullptr);
@@ -1414,7 +1444,10 @@ struct EditorContext
 
     void RegisterLinkAdjacency(Link* link);
     void UnregisterLinkAdjacency(Link* link);
+    void MarkObjectForDeletion(Object* object);
     uint64_t NextVisitStamp();
+    uint64_t GetFrameGeneration() const { return m_FrameGeneration; }
+    uint64_t GetPreviousFrameGeneration() const { return m_FrameGeneration > 1 ? m_FrameGeneration - 1 : 0; }
 
     void RemoveSettings(Object* object);
 
@@ -1486,7 +1519,7 @@ struct EditorContext
         ImRect bounds(FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX);
 
         for (auto object : objects)
-            if (object->m_IsLive)
+            if (object->IsLive())
                 bounds.Add(object->GetBounds());
 
         if (ImRect_IsEmpty(bounds))
@@ -1501,7 +1534,7 @@ struct EditorContext
         ImRect bounds(FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX);
 
         for (auto object : objects)
-            if (object.m_Object->m_IsLive)
+            if (object.m_Object->IsLive())
                 bounds.Add(object.m_Object->GetBounds());
 
         if (ImRect_IsEmpty(bounds))
@@ -1593,8 +1626,8 @@ private:
     std::unordered_map<uintptr_t, Pin*>  m_PinLookup;
     std::unordered_map<uintptr_t, Link*> m_LinkLookup;
 
-    std::unordered_map<uintptr_t, vector<Link*>> m_NodeLinks;
-    std::unordered_map<uintptr_t, vector<Link*>> m_PinLinks;
+    std::unordered_map<uintptr_t, LinkAdjacencyEntry> m_NodeLinks;
+    std::unordered_map<uintptr_t, LinkAdjacencyEntry> m_PinLinks;
 
     std::unordered_map<uint64_t, vector<Node*>> m_NodeSpatialBuckets;
     std::unordered_map<uint64_t, vector<Link*>> m_LinkSpatialBuckets;
@@ -1603,6 +1636,8 @@ private:
     bool          m_NodeSpatialIndexDirty;
     bool          m_LinkSpatialIndexDirty;
     uint64_t      m_NextVisitStamp;
+    uint64_t      m_FrameGeneration;
+    bool          m_HasPendingObjectDeletion;
 
     bool          m_ZOrderDirty;
 

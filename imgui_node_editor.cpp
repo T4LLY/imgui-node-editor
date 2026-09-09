@@ -715,6 +715,23 @@ ImLine ed::Pin::GetClosestLine(const Pin* pin) const
 
 
 
+bool ed::Object::IsLive() const
+{
+    return m_LiveGeneration != 0 && m_LiveGeneration == Editor->GetFrameGeneration();
+}
+
+bool ed::Object::WasLivePreviousFrame() const
+{
+    const auto previousGeneration = Editor->GetPreviousFrameGeneration();
+    return previousGeneration != 0 && m_LiveGeneration == previousGeneration;
+}
+
+void ed::Object::MarkLive()
+{
+    m_LiveGeneration = Editor->GetFrameGeneration();
+}
+
+
 //------------------------------------------------------------------------------
 //
 // Node
@@ -737,7 +754,7 @@ void ed::Node::UpdateInteractionBounds()
 
     for (auto pin = m_LastPin; pin; pin = pin->m_PreviousPin)
     {
-        if (!pin->m_IsLive)
+        if (!pin->IsLive())
             continue;
 
         if (!ImRect_IsEmpty(pin->m_Bounds))
@@ -763,7 +780,7 @@ void ed::Node::TranslateGeometry(const ImVec2& delta)
 
     for (auto pin = m_LastPin; pin; pin = pin->m_PreviousPin)
     {
-        if (!pin->m_IsLive)
+        if (!pin->IsLive())
             continue;
 
         pin->m_Bounds.Translate(delta);
@@ -1069,7 +1086,7 @@ void ed::Link::Draw(ImDrawList* drawList, DrawFlags flags)
 
 void ed::Link::Draw(ImDrawList* drawList, ImU32 color, float extraThickness) const
 {
-    if (!m_IsLive)
+    if (!IsLive())
         return;
 
     const auto curve = GetCurve();
@@ -1168,7 +1185,7 @@ ImCubicBezierPoints ed::Link::GetCurve() const
 
 bool ed::Link::TestHit(const ImVec2& point, float extraThickness) const
 {
-    if (!m_IsLive)
+    if (!IsLive())
         return false;
 
     auto bounds = m_Bounds;
@@ -1185,7 +1202,7 @@ bool ed::Link::TestHit(const ImVec2& point, float extraThickness) const
 
 bool ed::Link::TestHit(const ImRect& rect, bool allowIntersect) const
 {
-    if (!m_IsLive)
+    if (!IsLive())
         return false;
 
     if (rect.Contains(m_Bounds))
@@ -1242,6 +1259,8 @@ ed::EditorContext::EditorContext(const ax::NodeEditor::Config* config)
     , m_NodeSpatialIndexDirty(true)
     , m_LinkSpatialIndexDirty(true)
     , m_NextVisitStamp(1)
+    , m_FrameGeneration(0)
+    , m_HasPendingObjectDeletion(false)
     , m_ZOrderDirty(false)
     , m_VisibleLinks()
     , m_SelectionId(1)
@@ -1317,35 +1336,46 @@ void ed::EditorContext::Begin(const char* id, const ImVec2& size)
     if (m_LastControlActiveObject && m_LastControlActiveObject->m_DeleteOnNewFrame)
         m_LastControlActiveObject = nullptr;
 
-    static auto resetAndCollect = [](auto& objects, auto& lookup)
+    ++m_FrameGeneration;
+    if (m_FrameGeneration == 0)
     {
-        bool removed = false;
-        objects.erase(std::remove_if(objects.begin(), objects.end(), [&lookup, &removed](auto objectWrapper)
+        // Generation zero is reserved for dead objects. A wrap is practically
+        // unreachable, but clear retained generations so old objects cannot
+        // become live again when the counter restarts.
+        for (auto node : m_Nodes)
+            node->m_LiveGeneration = 0;
+        for (auto pin : m_Pins)
+            pin->m_LiveGeneration = 0;
+        for (auto link : m_Links)
+            link->m_LiveGeneration = 0;
+        m_FrameGeneration = 1;
+    }
+
+    bool removedNodes = false;
+    bool removedLinks = false;
+    if (m_HasPendingObjectDeletion)
+    {
+        static auto collectDeleted = [](auto& objects, auto& lookup)
         {
-            if (objectWrapper->m_DeleteOnNewFrame)
+            bool removed = false;
+            objects.erase(std::remove_if(objects.begin(), objects.end(), [&lookup, &removed](auto objectWrapper)
             {
+                if (!objectWrapper->m_DeleteOnNewFrame)
+                    return false;
+
                 lookup.erase(objectWrapper.m_ID.Get());
                 delete objectWrapper.m_Object;
                 removed = true;
                 return true;
-            }
+            }), objects.end());
+            return removed;
+        };
 
-            objectWrapper->Reset();
-            return false;
-        }), objects.end());
-        return removed;
-    };
-
-    const bool removedNodes = resetAndCollect(m_Nodes, m_NodeLookup);
-    resetAndCollect(m_Pins, m_PinLookup);
-    const bool removedLinks = resetAndCollect(m_Links, m_LinkLookup);
-
-    // Adjacency describes links submitted in the current frame. Rebuilding it
-    // incrementally in DoLink() avoids all-link scans in HasAnyLinks/BreakLinks.
-    for (auto& entry : m_NodeLinks)
-        entry.second.clear();
-    for (auto& entry : m_PinLinks)
-        entry.second.clear();
+        removedNodes = collectDeleted(m_Nodes, m_NodeLookup);
+        collectDeleted(m_Pins, m_PinLookup);
+        removedLinks = collectDeleted(m_Links, m_LinkLookup);
+        m_HasPendingObjectDeletion = false;
+    }
 
     if (removedNodes)
     {
@@ -1464,7 +1494,7 @@ void ed::EditorContext::End()
 
     // Draw nodes
     for (auto node : m_Nodes)
-        if (node->m_IsLive && node->IsFullSubmitted() && node->IsVisible())
+        if (node->IsLive() && node->IsFullSubmitted() && node->IsVisible())
             node->Draw(m_DrawList);
 
     // Draw only links whose cached curve bounds overlap the current clip rect.
@@ -1639,7 +1669,7 @@ void ed::EditorContext::End()
         // Copy group nodes
         auto fullNodeCount = static_cast<int>(std::count_if(m_Nodes.begin(), m_Nodes.end(), [](Node* node)
         {
-            return node->m_IsLive && node->IsFullSubmitted();
+            return node->IsLive() && node->IsFullSubmitted();
         }));
 
         // Reserve two additional channels for sorted list of channels
@@ -1650,7 +1680,7 @@ void ed::EditorContext::End()
 
         auto copyNode = [this, &targetChannel](Node* node)
         {
-            if (!node->m_IsLive || !node->IsFullSubmitted())
+            if (!node->IsLive() || !node->IsFullSubmitted())
                 return;
 
             for (int i = 0; i < c_ChannelsPerNode; ++i)
@@ -1817,14 +1847,14 @@ bool ed::EditorContext::DoLink(LinkId id, PinId startPinId, PinId endPinId, ImU3
     auto startPin = FindPin(startPinId);
     auto endPin   = FindPin(endPinId);
 
-    if (!startPin || !startPin->m_IsLive || !endPin || !endPin->m_IsLive)
+    if (!startPin || !startPin->IsLive() || !endPin || !endPin->IsLive())
         return false;
 
     startPin->m_HasConnection = true;
       endPin->m_HasConnection = true;
 
     auto link = GetLink(id);
-    if (link->m_IsLive)
+    if (link->IsLive())
         UnregisterLinkAdjacency(link);
 
     if (link->m_StartPin != startPin || link->m_EndPin != endPin)
@@ -1835,7 +1865,7 @@ bool ed::EditorContext::DoLink(LinkId id, PinId startPinId, PinId endPinId, ImU3
     link->m_Color          = color;
     link->m_HighlightColor = GetColor(StyleColor_HighlightLinkBorder);
     link->m_Thickness      = thickness;
-    link->m_IsLive         = true;
+    link->MarkLive();
 
     link->UpdateEndpoints();
     RegisterLinkAdjacency(link);
@@ -1849,7 +1879,7 @@ void ed::EditorContext::SetNodePosition(NodeId nodeId, const ImVec2& position)
     if (!node)
     {
         node = CreateNode(nodeId);
-        node->m_IsLive = false;
+        node->Reset();
     }
 
     if (node->m_Bounds.Min != position)
@@ -1866,7 +1896,7 @@ void ed::EditorContext::SetGroupSize(NodeId nodeId, const ImVec2& size)
     if (!node)
     {
         node = CreateNode(nodeId);
-        node->m_IsLive = false;
+        node->Reset();
     }
 
     node->m_Type = NodeType::Group;
@@ -1906,7 +1936,7 @@ void ed::EditorContext::SetNodeZPosition(NodeId nodeId, float z)
     if (!node)
     {
         node = CreateNode(nodeId);
-        node->m_IsLive = false;
+        node->Reset();
     }
 
     if (node->m_ZPosition != z)
@@ -2044,6 +2074,15 @@ void ed::EditorContext::ApplyPinStyle(Pin* pin, PinKind kind)
         pin->MarkGeometryDirty();
 }
 
+void ed::EditorContext::MarkObjectForDeletion(Object* object)
+{
+    if (!object)
+        return;
+
+    object->m_DeleteOnNewFrame = true;
+    m_HasPendingObjectDeletion = true;
+}
+
 uint64_t ed::EditorContext::NextVisitStamp()
 {
     ++m_NextVisitStamp;
@@ -2111,7 +2150,7 @@ void ed::EditorContext::QueryNodesInRect(const ImRect& r, vector<Node*>& result)
 
     auto append = [stamp, &result](Node* node)
     {
-        if (!node->m_IsLive || node->m_VisitStamp == stamp)
+        if (!node->IsLive() || node->m_VisitStamp == stamp)
             return;
         node->m_VisitStamp = stamp;
         result.push_back(node);
@@ -2159,7 +2198,7 @@ void ed::EditorContext::QueryLinksInRect(const ImRect& r, vector<Link*>& result)
 
     auto append = [stamp, &result](Link* link)
     {
-        if (!link->m_IsLive || link->m_VisitStamp == stamp)
+        if (!link->IsLive() || link->m_VisitStamp == stamp)
             return;
         link->m_VisitStamp = stamp;
         result.push_back(link);
@@ -2200,9 +2239,15 @@ void ed::EditorContext::RegisterLinkAdjacency(Link* link)
     if (!link || !link->m_StartPin || !link->m_EndPin)
         return;
 
-    auto append = [link](auto& map, uintptr_t key)
+    auto append = [this, link](auto& map, uintptr_t key)
     {
-        map[key].push_back(link);
+        auto& entry = map[key];
+        if (entry.m_Generation != m_FrameGeneration)
+        {
+            entry.m_Links.clear();
+            entry.m_Generation = m_FrameGeneration;
+        }
+        entry.m_Links.push_back(link);
     };
 
     append(m_PinLinks, link->m_StartPin->m_ID.Get());
@@ -2220,12 +2265,12 @@ void ed::EditorContext::UnregisterLinkAdjacency(Link* link)
     if (!link)
         return;
 
-    auto eraseLink = [link](auto& map, uintptr_t key)
+    auto eraseLink = [this, link](auto& map, uintptr_t key)
     {
         const auto it = map.find(key);
-        if (it == map.end())
+        if (it == map.end() || it->second.m_Generation != m_FrameGeneration)
             return;
-        auto& links = it->second;
+        auto& links = it->second.m_Links;
         links.erase(std::remove(links.begin(), links.end(), link), links.end());
         // Keep the bucket allocated so normal per-frame link resubmission can
         // reuse its capacity instead of reallocating adjacency vectors.
@@ -2262,12 +2307,12 @@ void ed::EditorContext::RefreshLiveLinkEndpoints(const vector<Object*>& movedObj
             continue;
 
         const auto linksIt = m_NodeLinks.find(node->m_ID.Get());
-        if (linksIt == m_NodeLinks.end())
+        if (linksIt == m_NodeLinks.end() || linksIt->second.m_Generation != m_FrameGeneration)
             continue;
 
-        for (auto link : linksIt->second)
+        for (auto link : linksIt->second.m_Links)
         {
-            if (!link->m_IsLive || link->m_VisitStamp == stamp)
+            if (!link->IsLive() || link->m_VisitStamp == stamp)
                 continue;
             link->m_VisitStamp = stamp;
             link->UpdateEndpoints();
@@ -2308,7 +2353,7 @@ bool ed::EditorContext::ValidateVirtualNode(const VirtualNodeDesc& desc, Node* n
     if (desc.PinCount < 0 || (desc.PinCount > 0 && desc.Pins == nullptr))
         return false;
 
-    if (node && (node->m_Submission != NodeSubmissionKind::None || ::IsGroup(node)))
+    if (node && ((node->IsLive() && node->m_Submission != NodeSubmissionKind::None) || ::IsGroup(node)))
         return false;
 
     for (int i = 0; i < desc.PinCount; ++i)
@@ -2331,7 +2376,7 @@ bool ed::EditorContext::ValidateVirtualNode(const VirtualNodeDesc& desc, Node* n
                 return false;
 
         if (auto existing = const_cast<EditorContext*>(this)->FindPin(pin.Id))
-            if (existing->m_IsLive)
+            if (existing->IsLive())
                 return false;
     }
 
@@ -2343,7 +2388,7 @@ void ed::EditorContext::SubmitVirtualPin(Node* node, const ImVec2& origin, const
     auto pin = GetPin(desc.Id, desc.Kind);
 
     pin->m_Node   = node;
-    pin->m_IsLive = true;
+    pin->BeginFrame();
     ApplyPinStyle(pin, desc.Kind);
 
     pin->m_Bounds.Min = ImFloor(origin + desc.BoundsMinOffset);
@@ -2373,7 +2418,7 @@ bool ed::EditorContext::SubmitVirtualNode(const VirtualNodeDesc& desc)
 
     PrepareNodeForSubmission(node);
 
-    node->m_IsLive      = true;
+    node->BeginFrame();
     node->m_Submission  = NodeSubmissionKind::Virtual;
     node->m_LastPin     = nullptr;
     node->m_Type        = NodeType::Node;
@@ -2541,24 +2586,24 @@ void ed::EditorContext::FindLinksInRect(const ImRect& r, vector<Link*>& result, 
 bool ed::EditorContext::HasAnyLinks(NodeId nodeId) const
 {
     const auto it = m_NodeLinks.find(nodeId.Get());
-    return it != m_NodeLinks.end() && !it->second.empty();
+    return it != m_NodeLinks.end() && it->second.m_Generation == m_FrameGeneration && !it->second.m_Links.empty();
 }
 
 bool ed::EditorContext::HasAnyLinks(PinId pinId) const
 {
     const auto it = m_PinLinks.find(pinId.Get());
-    return it != m_PinLinks.end() && !it->second.empty();
+    return it != m_PinLinks.end() && it->second.m_Generation == m_FrameGeneration && !it->second.m_Links.empty();
 }
 
 int ed::EditorContext::BreakLinks(NodeId nodeId)
 {
     const auto it = m_NodeLinks.find(nodeId.Get());
-    if (it == m_NodeLinks.end())
+    if (it == m_NodeLinks.end() || it->second.m_Generation != m_FrameGeneration)
         return 0;
 
     int result = 0;
-    for (auto link : it->second)
-        if (link->m_IsLive && GetItemDeleter().Add(link))
+    for (auto link : it->second.m_Links)
+        if (link->IsLive() && GetItemDeleter().Add(link))
             ++result;
     return result;
 }
@@ -2566,12 +2611,12 @@ int ed::EditorContext::BreakLinks(NodeId nodeId)
 int ed::EditorContext::BreakLinks(PinId pinId)
 {
     const auto it = m_PinLinks.find(pinId.Get());
-    if (it == m_PinLinks.end())
+    if (it == m_PinLinks.end() || it->second.m_Generation != m_FrameGeneration)
         return 0;
 
     int result = 0;
-    for (auto link : it->second)
-        if (link->m_IsLive && GetItemDeleter().Add(link))
+    for (auto link : it->second.m_Links)
+        if (link->IsLive() && GetItemDeleter().Add(link))
             ++result;
     return result;
 }
@@ -2582,12 +2627,12 @@ void ed::EditorContext::FindLinksForNode(NodeId nodeId, vector<Link*>& result, b
         result.clear();
 
     const auto it = m_NodeLinks.find(nodeId.Get());
-    if (it == m_NodeLinks.end())
+    if (it == m_NodeLinks.end() || it->second.m_Generation != m_FrameGeneration)
         return;
 
     const auto firstAdded = result.size();
-    for (auto link : it->second)
-        if (link->m_IsLive)
+    for (auto link : it->second.m_Links)
+        if (link->IsLive())
             result.push_back(link);
 
     std::sort(result.begin() + firstAdded, result.end(), [](const Link* lhs, const Link* rhs)
@@ -2599,7 +2644,7 @@ void ed::EditorContext::FindLinksForNode(NodeId nodeId, vector<Link*>& result, b
 bool ed::EditorContext::PinHadAnyLinks(PinId pinId)
 {
     auto pin = FindPin(pinId);
-    if (!pin || !pin->m_IsLive)
+    if (!pin || !pin->IsLive())
         return false;
 
     return pin->m_HasConnection || pin->m_HadConnection;
@@ -2662,17 +2707,17 @@ bool ed::EditorContext::CanAcceptUserInput() const
 
 int ed::EditorContext::CountLiveNodes() const
 {
-    return (int)std::count_if(m_Nodes.begin(),  m_Nodes.end(),  [](const Node* node)  { return node->m_IsLive; });
+    return (int)std::count_if(m_Nodes.begin(),  m_Nodes.end(),  [](const Node* node)  { return node->IsLive(); });
 }
 
 int ed::EditorContext::CountLivePins() const
 {
-    return (int)std::count_if(m_Pins.begin(),   m_Pins.end(),   [](const Pin*  pin)   { return pin->m_IsLive; });
+    return (int)std::count_if(m_Pins.begin(),   m_Pins.end(),   [](const Pin*  pin)   { return pin->IsLive(); });
 }
 
 int ed::EditorContext::CountLiveLinks() const
 {
-    return (int)std::count_if(m_Links.begin(),  m_Links.end(),  [](const Link* link)  { return link->m_IsLive; });
+    return (int)std::count_if(m_Links.begin(),  m_Links.end(),  [](const Link* link)  { return link->IsLive(); });
 }
 
 ed::Pin* ed::EditorContext::CreatePin(PinId id, PinKind kind)
@@ -2704,7 +2749,7 @@ ed::Node* ed::EditorContext::CreateNode(NodeId id)
     if (settings->m_GroupSize.x > 0 || settings->m_GroupSize.y > 0)
         node->m_Type = NodeType::Group;
 
-    node->m_IsLive = false;
+    node->Reset();
 
     return node;
 }
@@ -2869,7 +2914,7 @@ int ed::EditorContext::GetNodeIds(NodeId* nodes, int size) const
     int result = 0;
     for (auto node : m_Nodes)
     {
-        if (!node->m_IsLive)
+        if (!node->IsLive())
             continue;
 
         *nodes++ = node->m_ID;
@@ -3064,7 +3109,7 @@ ed::Control ed::EditorContext::BuildControl(bool allowOffscreen)
 
     auto appendInteractionNode = [&interactionNodes](Node* node)
     {
-        if (!node || !node->m_IsLive)
+        if (!node || !node->IsLive())
             return;
         if (std::find(interactionNodes.begin(), interactionNodes.end(), node) == interactionNodes.end())
             interactionNodes.push_back(node);
@@ -3098,7 +3143,7 @@ ed::Control ed::EditorContext::BuildControl(bool allowOffscreen)
         // retained interaction bounds used by the spatial index includes them.
         for (auto pin = node->m_LastPin; pin; pin = pin->m_PreviousPin)
         {
-            if (!pin->m_IsLive) continue;
+            if (!pin->IsLive()) continue;
 
             checkInteractionsInArea(pin->m_ID, pin->m_Bounds, pin);
         }
@@ -3824,7 +3869,7 @@ void ed::FlowAnimation::Draw(ImDrawList* drawList)
 
 bool ed::FlowAnimation::IsLinkValid() const
 {
-    return m_Link && m_Link->m_IsLive;
+    return m_Link && m_Link->IsLive();
 }
 
 bool ed::FlowAnimation::IsPathValid() const
@@ -3913,7 +3958,7 @@ ed::FlowAnimationController::~FlowAnimationController()
 
 void ed::FlowAnimationController::Flow(Link* link, FlowDirection direction)
 {
-    if (!link || !link->m_IsLive)
+    if (!link || !link->IsLive())
         return;
 
     auto& editorStyle = GetStyle();
@@ -5629,7 +5674,7 @@ void ed::DeleteItemsAction::DeleteDeadLinks(NodeId nodeId)
     Editor->FindLinksForNode(nodeId, links, true);
     for (auto link : links)
     {
-        link->m_DeleteOnNewFrame = true;
+        Editor->MarkObjectForDeletion(link);
 
         auto it = std::find(m_CandidateObjects.begin(), m_CandidateObjects.end(), link);
         if (it != m_CandidateObjects.end())
@@ -5646,7 +5691,7 @@ void ed::DeleteItemsAction::DeleteDeadPins(NodeId nodeId)
         return;
 
     for (auto pin = node->m_LastPin; pin; pin = pin->m_PreviousPin)
-        pin->m_DeleteOnNewFrame = true;
+        Editor->MarkObjectForDeletion(pin);
 }
 
 ed::EditorAction::AcceptResult ed::DeleteItemsAction::Accept(const Control& control)
@@ -5862,7 +5907,7 @@ void ed::DeleteItemsAction::RemoveItem(bool deleteDependencies)
 
     Editor->RemoveSettings(item);
 
-    item->m_DeleteOnNewFrame = true;
+    Editor->MarkObjectForDeletion(item);
 
     if (deleteDependencies && m_CurrentItemType == Node)
     {
@@ -5909,7 +5954,7 @@ void ed::NodeBuilder::Begin(NodeId nodeId)
     IM_ASSERT(nullptr == m_CurrentNode);
 
     m_CurrentNode = Editor->GetNode(nodeId);
-    IM_ASSERT(m_CurrentNode->m_Submission == NodeSubmissionKind::None);
+    IM_ASSERT(!m_CurrentNode->IsLive());
 
     Editor->PrepareNodeForSubmission(m_CurrentNode);
 
@@ -5918,7 +5963,7 @@ void ed::NodeBuilder::Begin(NodeId nodeId)
 
     auto& editorStyle = Editor->GetStyle();
 
-    m_CurrentNode->m_IsLive     = true;
+    m_CurrentNode->BeginFrame();
     m_CurrentNode->m_Submission = NodeSubmissionKind::Full;
     m_CurrentNode->m_LastPin    = nullptr;
     Editor->ApplyNodeStyle(m_CurrentNode);
@@ -6012,7 +6057,7 @@ void ed::NodeBuilder::BeginPin(PinId pinId, PinKind kind)
     m_CurrentPin = Editor->GetPin(pinId, kind);
     m_CurrentPin->m_Node = m_CurrentNode;
 
-    m_CurrentPin->m_IsLive = true;
+    m_CurrentPin->BeginFrame();
     Editor->ApplyPinStyle(m_CurrentPin, kind);
 
     m_CurrentPin->m_PreviousPin = m_CurrentNode->m_LastPin;
@@ -6147,7 +6192,7 @@ ImDrawList* ed::NodeBuilder::GetUserBackgroundDrawList() const
 
 ImDrawList* ed::NodeBuilder::GetUserBackgroundDrawList(Node* node) const
 {
-    if (node && node->m_IsLive && node->IsFullSubmitted())
+    if (node && node->IsLive() && node->IsFullSubmitted())
     {
         auto drawList = Editor->GetDrawList();
         drawList->ChannelsSetCurrent(node->m_Channel + c_NodeUserBackgroundChannel);

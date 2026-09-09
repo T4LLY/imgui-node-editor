@@ -732,6 +732,39 @@ void test_link_adjacency_tracks_rebound_link_endpoints()
     });
 }
 
+void test_generation_liveness_and_previous_pin_connections()
+{
+    Fixture fixture;
+
+    fixture.frame([] {
+        Fixture::submit_two_nodes(true);
+        CHECK(ed::GetNodeCount() == 2);
+        CHECK(ed::HasAnyLinks(ed::NodeId(1)));
+        CHECK(ed::PinHadAnyLinks(ed::PinId(11)));
+    });
+
+    fixture.frame([] {
+        Fixture::submit_two_nodes(false);
+        CHECK(ed::GetNodeCount() == 2);
+        CHECK(!ed::HasAnyLinks(ed::NodeId(1)));
+        CHECK(!ed::HasAnyLinks(ed::PinId(11)));
+        CHECK(ed::PinHadAnyLinks(ed::PinId(11)));
+    });
+
+    fixture.frame([] {
+        ed::BeginNode(ed::NodeId(1));
+        ImGui::TextUnformatted("Source");
+        ed::BeginPin(ed::PinId(11), ed::PinKind::Output);
+        ImGui::TextUnformatted("Out");
+        ed::EndPin();
+        ed::EndNode();
+
+        CHECK(ed::GetNodeCount() == 1);
+        CHECK(!ed::HasAnyLinks(ed::NodeId(1)));
+        CHECK(!ed::PinHadAnyLinks(ed::PinId(11)));
+    });
+}
+
 } // namespace
 
 int main()
@@ -753,6 +786,7 @@ int main()
     test_visible_link_candidates_keep_cross_view_links_interactive();
     test_large_virtual_graph_uses_retained_spatial_candidates();
     test_link_adjacency_tracks_rebound_link_endpoints();
+    test_generation_liveness_and_previous_pin_connections();
 
     if (g_failures != 0)
     {
