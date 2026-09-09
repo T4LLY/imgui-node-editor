@@ -2177,20 +2177,19 @@ void ed::EditorContext::RegisterLinkAdjacency(Link* link)
     if (!link || !link->m_StartPin || !link->m_EndPin)
         return;
 
-    auto appendUnique = [link](auto& map, uintptr_t key)
+    auto append = [link](auto& map, uintptr_t key)
     {
-        auto& links = map[key];
-        if (std::find(links.begin(), links.end(), link) == links.end())
-            links.push_back(link);
+        map[key].push_back(link);
     };
 
-    appendUnique(m_PinLinks, link->m_StartPin->m_ID.Get());
-    appendUnique(m_PinLinks, link->m_EndPin->m_ID.Get());
+    append(m_PinLinks, link->m_StartPin->m_ID.Get());
+    if (link->m_EndPin != link->m_StartPin)
+        append(m_PinLinks, link->m_EndPin->m_ID.Get());
 
     if (link->m_StartPin->m_Node)
-        appendUnique(m_NodeLinks, link->m_StartPin->m_Node->m_ID.Get());
+        append(m_NodeLinks, link->m_StartPin->m_Node->m_ID.Get());
     if (link->m_EndPin->m_Node && link->m_EndPin->m_Node != link->m_StartPin->m_Node)
-        appendUnique(m_NodeLinks, link->m_EndPin->m_Node->m_ID.Get());
+        append(m_NodeLinks, link->m_EndPin->m_Node->m_ID.Get());
 }
 
 void ed::EditorContext::UnregisterLinkAdjacency(Link* link)
