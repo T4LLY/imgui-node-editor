@@ -3434,8 +3434,6 @@ void ed::Settings::MakeDirty(SaveReasonFlags reason, Node* node)
 
 std::string ed::Settings::Serialize()
 {
-    json::value result;
-
     auto serializeObjectId = [](ObjectId id)
     {
         auto value = std::to_string(reinterpret_cast<uintptr_t>(id.AsPointer()));
@@ -3449,18 +3447,38 @@ std::string ed::Settings::Serialize()
         }
     };
 
-    auto& nodes = result["nodes"];
+    auto& nodes = m_Serialized["nodes"];
+    bool hasUsedNodes = false;
     for (auto& node : m_Nodes)
     {
-        if (node.m_WasUsed)
-            nodes[serializeObjectId(node.m_ID)] = node.Serialize();
-    }
+        hasUsedNodes = hasUsedNodes || node.m_WasUsed;
+        const bool changed = !node.m_SerializedValid
+            || node.m_SerializedWasUsed != node.m_WasUsed
+            || node.m_SerializedLocation != node.m_Location
+            || node.m_SerializedGroupSize != node.m_GroupSize;
+        if (!changed)
+            continue;
 
-    auto& selection = result["selection"];
+        auto key = serializeObjectId(node.m_ID);
+        if (node.m_WasUsed)
+            nodes[key] = node.Serialize();
+        else if (nodes.is_object())
+            nodes.erase(key);
+
+        node.m_SerializedLocation  = node.m_Location;
+        node.m_SerializedGroupSize = node.m_GroupSize;
+        node.m_SerializedWasUsed   = node.m_WasUsed;
+        node.m_SerializedValid     = true;
+    }
+    if (!hasUsedNodes)
+        nodes = json::value();
+
+    auto& selection = m_Serialized["selection"];
+    selection = json::value();
     for (auto& id : m_Selection)
         selection.push_back(serializeObjectId(id));
 
-    auto& view = result["view"];
+    auto& view = m_Serialized["view"];
     view["scroll"]["x"] = m_ViewScroll.x;
     view["scroll"]["y"] = m_ViewScroll.y;
     view["zoom"]   = m_ViewZoom;
@@ -3469,7 +3487,7 @@ std::string ed::Settings::Serialize()
     view["visible_rect"]["max"]["x"] = m_VisibleRect.Max.x;
     view["visible_rect"]["max"]["y"] = m_VisibleRect.Max.y;
 
-    return result.dump();
+    return m_Serialized.dump();
 }
 
 bool ed::Settings::Parse(const std::string& string, Settings& settings)
@@ -3563,6 +3581,10 @@ bool ed::Settings::Parse(const std::string& string, Settings& settings)
         if (!viewValue.contains("visible_rect") || !tryParseVector(viewValue["visible_rect"]["min"], result.m_VisibleRect.Min) || !tryParseVector(viewValue["visible_rect"]["max"], result.m_VisibleRect.Max))
             result.m_VisibleRect = {};
     }
+
+    result.m_Serialized = json::value();
+    for (auto& node : result.m_Nodes)
+        node.m_SerializedValid = false;
 
     settings = std::move(result);
 

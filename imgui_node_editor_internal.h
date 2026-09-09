@@ -541,6 +541,11 @@ struct NodeSettings
     bool            m_IsDirty;
     SaveReasonFlags m_DirtyReason;
 
+    ImVec2 m_SerializedLocation;
+    ImVec2 m_SerializedGroupSize;
+    bool   m_SerializedWasUsed;
+    bool   m_SerializedValid;
+
     NodeSettings(NodeId id)
         : m_ID(id)
         , m_Location(0, 0)
@@ -550,6 +555,10 @@ struct NodeSettings
         , m_Saved(false)
         , m_IsDirty(false)
         , m_DirtyReason(SaveReasonFlags::None)
+        , m_SerializedLocation(0, 0)
+        , m_SerializedGroupSize(0, 0)
+        , m_SerializedWasUsed(false)
+        , m_SerializedValid(false)
     {
     }
 
@@ -573,6 +582,7 @@ struct Settings
     ImVec2               m_ViewScroll;
     float                m_ViewZoom;
     ImRect               m_VisibleRect;
+    json::value          m_Serialized;
 
     Settings()
         : m_IsDirty(false)
@@ -580,6 +590,7 @@ struct Settings
         , m_ViewScroll(0, 0)
         , m_ViewZoom(1.0f)
         , m_VisibleRect()
+        , m_Serialized()
     {
     }
 
