@@ -1312,6 +1312,7 @@ struct Config: ax::NodeEditor::Config
     std::string Load();
     std::string LoadNode(NodeId nodeId);
 
+    bool HasSaveTarget() const;
     void BeginSave();
     bool Save(const std::string& data, SaveReasonFlags flags);
     bool SaveNode(NodeId nodeId, const std::string& data, SaveReasonFlags flags);

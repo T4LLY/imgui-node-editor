@@ -2767,6 +2767,12 @@ void ed::EditorContext::LoadSettings()
 
 void ed::EditorContext::SaveSettings()
 {
+    if (!m_Config.HasSaveTarget())
+    {
+        m_Settings.ClearDirty();
+        return;
+    }
+
     m_Config.BeginSave();
 
     for (auto& node : m_Nodes)
@@ -6419,6 +6425,11 @@ std::string ed::Config::LoadNode(NodeId nodeId)
     }
 
     return data;
+}
+
+bool ed::Config::HasSaveTarget() const
+{
+    return SaveSettings || SettingsFile || SaveNodeSettings;
 }
 
 void ed::Config::BeginSave()

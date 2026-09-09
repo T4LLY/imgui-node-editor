@@ -40,8 +40,10 @@ struct MemorySettings
 {
     std::string global;
     std::unordered_map<std::uintptr_t, std::string> nodes;
-    int begin_save_count = 0;
-    int end_save_count   = 0;
+    int begin_save_count    = 0;
+    int end_save_count      = 0;
+    int save_settings_count = 0;
+    bool save_settings_result = true;
 
     static void BeginSave(void* user_pointer)
     {
@@ -56,8 +58,9 @@ struct MemorySettings
     static bool SaveSettings(const char* data, size_t size, ed::SaveReasonFlags, void* user_pointer)
     {
         auto& self  = *static_cast<MemorySettings*>(user_pointer);
+        ++self.save_settings_count;
         self.global = std::string(data, size);
-        return true;
+        return self.save_settings_result;
     }
 
     static size_t LoadSettings(char* data, void* user_pointer)
@@ -117,6 +120,20 @@ public:
             config.SaveNodeSettings    = &MemorySettings::SaveNodeSettings;
             config.LoadNodeSettings    = &MemorySettings::LoadNodeSettings;
         }
+        m_editor = ed::CreateEditor(&config);
+        ed::SetCurrentEditor(m_editor);
+    }
+
+    explicit Fixture(const ed::Config& config)
+    {
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        auto& io       = ImGui::GetIO();
+        io.DisplaySize = ImVec2(1024.0f, 768.0f);
+        io.DeltaTime   = 1.0f / 60.0f;
+        io.Fonts->AddFontDefault();
+        io.Fonts->Build();
+
         m_editor = ed::CreateEditor(&config);
         ed::SetCurrentEditor(m_editor);
     }
@@ -353,6 +370,42 @@ void test_settings_restore()
         fixture.frame([] { Fixture::submit_two_nodes(); });
         CHECK(near(ed::GetNodePosition(ed::NodeId(1)), ImVec2(333.0f, 222.0f)));
         CHECK(ed::IsNodeSelected(ed::NodeId(1)));
+    }
+}
+
+void test_disabled_persistence_skips_save_sessions()
+{
+    MemorySettings memory;
+    ed::Config config;
+    config.SettingsFile     = nullptr;
+    config.UserPointer      = &memory;
+    config.BeginSaveSession = &MemorySettings::BeginSave;
+    config.EndSaveSession   = &MemorySettings::EndSave;
+
+    {
+        Fixture fixture(config);
+        fixture.frame([] { Fixture::submit_two_nodes(); });
+        fixture.frame([] { Fixture::submit_two_nodes(); });
+    }
+
+    CHECK(memory.begin_save_count == 0);
+    CHECK(memory.end_save_count == 0);
+    CHECK(memory.save_settings_count == 0);
+}
+
+void test_failed_settings_save_is_retried()
+{
+    MemorySettings memory;
+    memory.save_settings_result = false;
+
+    {
+        Fixture fixture(&memory);
+        fixture.frame([] { Fixture::submit_two_nodes(); });
+        const int first_save_count = memory.save_settings_count;
+        CHECK(first_save_count > 0);
+
+        fixture.frame([] { Fixture::submit_two_nodes(); });
+        CHECK(memory.save_settings_count > first_save_count);
     }
 }
 
@@ -689,6 +742,8 @@ int main()
     test_navigation_and_coordinate_round_trip();
     test_programmatic_delete_flow();
     test_settings_restore();
+    test_disabled_persistence_skips_save_sessions();
+    test_failed_settings_save_is_retried();
     test_create_api_idle_smoke();
     test_repeated_frame_liveness();
     test_virtual_node_submission_keeps_links_and_geometry_alive();
