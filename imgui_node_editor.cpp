@@ -1605,10 +1605,38 @@ void ed::EditorContext::End()
     {
         if (!IsGroup(control.ActiveNode))
         {
-            // Bring active node to front
-            auto activeNodeIt = std::find(m_Nodes.begin(), m_Nodes.end(), control.ActiveNode);
-            std::rotate(activeNodeIt, activeNodeIt + 1, m_Nodes.end());
-            nodeOrderChanged = true;
+            // Bring active node to front. m_OrderIndex is kept in sync whenever
+            // the retained order changes, so avoid scanning the entire node list.
+            const auto activeNodeIndex = control.ActiveNode->m_OrderIndex;
+            IM_ASSERT(activeNodeIndex < m_Nodes.size() && m_Nodes[activeNodeIndex] == control.ActiveNode);
+
+            auto activeNodeIt = m_Nodes.begin() + activeNodeIndex;
+            auto nextNodeIt   = activeNodeIt + 1;
+
+            // When Z order is stable, nodes are already sorted by Z. Moving the
+            // active node to the end only affects nodes in the same Z tier. If
+            // it is already last in that tier, rotating and stable-sorting again
+            // would reproduce the exact same order.
+            bool needsReorder = false;
+            if (nextNodeIt != m_Nodes.end())
+            {
+                if (m_ZOrderDirty)
+                {
+                    needsReorder = true;
+                }
+                else
+                {
+                    const auto activeZ = control.ActiveNode->m_ZPosition;
+                    const auto nextZ   = (*nextNodeIt)->m_ZPosition;
+                    needsReorder = !(activeZ < nextZ) && !(nextZ < activeZ);
+                }
+            }
+
+            if (needsReorder)
+            {
+                std::rotate(activeNodeIt, nextNodeIt, m_Nodes.end());
+                nodeOrderChanged = true;
+            }
         }
         else if (!isDragging && m_CurrentAction && m_CurrentAction->AsDrag())
         {
