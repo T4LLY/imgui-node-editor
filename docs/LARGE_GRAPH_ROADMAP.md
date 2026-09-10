@@ -1,12 +1,13 @@
-# Large-Graph Roadmap
+# Large-Graph Performance
 
-This roadmap starts from the currently working virtual-node implementation. The goal
-is to improve large-graph CPU scaling without turning `imgui-node-editor` into a new
-retained GUI framework or destabilizing the normal API.
+This document records the large-graph performance work that is already implemented
+in this fork and the optimizations that were deliberately deferred.
 
-## Current baseline
+The goal is to keep large graphs responsive without turning `imgui-node-editor`
+into a different retained GUI framework or adding complexity that is not justified
+by measured costs.
 
-The following work is already present in this fork:
+## Current implementation
 
 ### Compatibility and safety
 
@@ -33,207 +34,243 @@ The following work is already present in this fork:
 - Retained node/link spatial buckets.
 - Dirty-only Z-order sorting.
 
-This is the first practical integration point. Consumer integration and real-world
-measurement should happen before deeper architectural work.
+## Completed performance work
 
-## Phase 8 — Benchmark and instrumentation
+The following optimizations are implemented and should no longer be treated as
+roadmap TODOs.
 
-**Priority: highest. Do this before speculative optimization.**
+### Remove redundant pin/link sorting
 
-Add a benchmark/example that can generate deterministic graphs at roughly:
+Pin and link lookup now uses the existing lookup maps. `CreatePin()` and
+`CreateLink()` therefore no longer sort the full retained vectors after every
+insertion.
 
-```text
-100
-1,000
-10,000 nodes
-```
+This removes an old requirement from the previous `lower_bound()` lookup path and
+substantially reduces initial construction cost for large graphs.
 
-with configurable link density and visible ratio.
+### Remove adjacency duplicate scans
 
-Measure separately:
+Per-frame adjacency is rebuilt from an empty generation. Registration therefore no
+longer performs a linear `std::find()` before every append.
 
-- editor `Begin()` / reset;
-- full node submission;
-- virtual node submission;
-- pin submission;
-- `BuildControl()` / interaction broad phase;
-- spatial queries/rebuilds;
-- link submission and endpoint updates;
-- visible-link rebuild;
-- draw-channel growth/reorder/merge;
-- editor `End()` total.
+Same-LinkId resubmission still unregisters the previous adjacency first. Self-links
+are explicitly prevented from inserting the same pin/node adjacency twice.
 
-Scenarios:
+This avoids quadratic behavior for high-degree nodes such as star topologies.
 
-- idle;
-- pan;
-- zoom;
-- one-node drag;
-- multi-node drag;
-- link hover;
-- rectangle selection;
-- topology edit;
-- 100%, 10%, and 1% visible.
+### Avoid persistence work when persistence is disabled
 
-Prefer stable counters/timers that can run in CI or a benchmark executable over
-profiling hooks embedded permanently in the public API.
+When no settings file and no save callback are configured, the editor no longer
+serializes settings every frame while leaving the persistent dirty state set.
 
-### Exit criterion
+A real save failure is still treated differently: dirty state is retained so the
+save can be retried.
 
-A profile identifies the dominant remaining costs for 1k and 10k graphs. Later
-phases should be justified by those measurements.
+### Cache node settings serialization
 
-## Phase 9 — Incremental spatial-index updates
+The settings serializer retains the existing JSON tree and updates changed node
+entries instead of reconstructing every node object for every save.
 
-**Priority: high if drag/topology benchmarks show rebuild spikes.**
+The external settings format is unchanged. Final JSON output still requires a full
+`dump()`, so the last output step remains O(number of serialized settings).
 
-The current spatial index is retained but rebuilt globally after geometry is marked
-dirty. Moving one node can therefore cause a later query to rebuild all indexed
-nodes; moving adjacent link endpoints can similarly invalidate the link index.
+### Skip unchanged link geometry updates
 
-Replace coarse dirty/rebuild behavior with incremental membership updates:
+Pins carry a geometry revision. Links remember the revisions of their start/end
+pins and skip endpoint/Bezier/bounds recomputation when the relevant geometry has
+not changed.
+
+Node movement and pin geometry changes advance the revision, so connected links are
+still refreshed when required.
+
+### Generation-based object lifetime and lazy frame reset
+
+Frame start no longer eagerly resets every retained node, pin, link, and adjacency
+bucket.
+
+Object liveness is tracked with frame generations. Per-frame node/pin state is reset
+lazily when the object is actually submitted, and adjacency buckets use generations
+instead of a global clear pass.
+
+Deletion cleanup is only scanned when deletion has actually been requested.
+
+This removes the previous O(total retained objects) `Begin()` reset from normal
+frames.
+
+### Avoid redundant active-node reordering
+
+Active-node lookup uses the retained order index rather than scanning the node
+vector. If the active node is already at the front of its Z-order tier, the editor
+also skips the redundant rotate/sort path.
+
+## Performance characteristics
+
+The important scaling properties after the completed work are:
+
+- retained object lookup is map-based rather than dependent on sorted vectors;
+- adjacency construction is linear in submitted links rather than quadratic in node
+  degree;
+- normal `Begin()` work is no longer proportional to every retained object;
+- unchanged links reuse endpoint/Bezier/bounds geometry;
+- off-screen nodes can use the virtual-node path and avoid normal ImGui node
+  contents/draw channels;
+- interaction and visible-link work use retained spatial broad-phase indexes.
+
+Development profiling during this optimization work used graphs up to roughly
+100k nodes / 100k links. Those measurements were useful for finding bottlenecks but
+are not a committed benchmark contract; application-level profiling should remain
+the deciding signal for further work.
+
+## Remaining known costs
+
+These are known costs, not automatic implementation tasks.
+
+### Spatial-index rebuilds
+
+The spatial indexes are retained, but a relevant bounds change can still cause a
+later query to rebuild the affected index globally. This is O(total indexed
+objects).
+
+At 10k-scale workloads this was not large enough to justify the bookkeeping and
+invalidation complexity of fully incremental membership updates. Revisit only if
+profiling shows spatial rebuilds dominating node drag, topology edits, or other
+representative workloads.
+
+### Final settings JSON output
+
+Cached node entries avoid rebuilding unchanged node objects, but final JSON `dump()`
+still walks the complete serialized document.
+
+This can produce save-time spikes for very large settings sets. It does not affect
+normal frames when no save is required.
+
+### Link submission
+
+Links are still submitted each frame. Cached geometry makes unchanged submissions
+cheaper, but the submission loop remains O(total submitted links).
+
+A persistent link/topology API could remove this cost, but that would change the
+lifetime contract substantially and is intentionally not part of the current
+optimization set.
+
+### Visible draw cost
+
+Virtualization removes off-screen node rendering cost. It cannot remove the cost of
+thousands of nodes that are simultaneously visible at low zoom.
+
+Visible ImGui geometry, text, link tessellation, draw channels, and canvas vertex
+transforms therefore remain workload-dependent costs.
+
+## Deferred optimizations
+
+The following work was investigated and intentionally left out because it requires a
+larger architectural or visible-behavior change than the measured benefit currently
+justifies.
+
+### Incremental spatial-index updates
+
+Possible approach:
 
 ```text
 object
-  -> previous spatial cells
-  -> remove from old cells
-  -> insert into new cells
+  -> previous occupied cells
+  -> remove old memberships
+  -> insert new memberships
 ```
 
-Update only:
+A complete implementation must handle:
 
-- the moved/resized node;
-- its pins indirectly through node geometry;
-- links adjacent to that node;
-- added/removed objects.
+- previous-cell ownership/back-references;
+- removal without stale pointers;
+- negative cell coordinates;
+- large-object overflow membership;
+- deletion and generation lifetime interaction;
+- group/resize and multi-node movement;
+- links that change endpoint pins under the same LinkId;
+- efficient bulk restore/import.
 
-Keep a safe full-rebuild path for bulk restore/import and validation/debug builds.
+Do not implement a partial incremental path that leaves ambiguous ownership between
+full rebuilds and per-object updates. Add it only if profiling demonstrates that
+spatial rebuilds are a real bottleneck.
 
-### Things to verify
+### Long-link spatial indexing
 
-- objects crossing negative cell coordinates;
-- very large objects using the overflow path;
-- cell-list removal without dangling pointers;
-- group/resize behavior;
-- multi-node drag;
-- links changing endpoint pins under the same LinkId.
+Links are currently indexed by retained bounds. A very long diagonal Bezier can
+cover a large AABB and may use the spatial overflow path even though the curve itself
+occupies little area.
 
-### Exit criterion
+A possible future solution is to index a link as a small number of curve segments
+instead of one large AABB. That requires decisions about segment count/flatness,
+query-result deduplication, update cost, and interaction with link geometry cache.
 
-Dragging one node in a 10k-node graph no longer produces work proportional to all
-nodes/links solely because of spatial-index maintenance.
+This is topology-dependent and should only be implemented for workloads that
+actually contain enough long cross-graph links to make overflow scanning expensive.
 
-## Phase 10 — Persistent virtual objects
+### Persistent virtual objects / topology
 
-**Priority: high only when per-frame virtual submission becomes measurable.**
-
-Today virtual nodes are lightweight, but the application still calls
-`SubmitVirtualNode()` for every off-screen node every frame and submits the pins in
-the descriptor. That keeps frame cost O(total nodes + total virtual pins).
-
-Introduce an optional persistent topology/geometry API, for example conceptually:
+Virtual nodes are lightweight but are still submitted each frame. A retained API
+could conceptually provide operations such as:
 
 ```cpp
-RegisterVirtualNode(...);   // create once
-UpdateVirtualNode(...);     // only when geometry/topology changes
+RegisterVirtualNode(...);
+UpdateVirtualNode(...);
 RemoveVirtualNode(...);
 ```
 
-or an equivalent generation-based contract.
-
-The important semantic distinction is:
+with the semantic distinction:
 
 ```text
 not submitted this frame != dead
 ```
 
-A persistent virtual object should remain available to selection, navigation, links,
-and spatial queries until explicitly invalidated or removed.
+The current generation-based lifetime optimization does not provide this API; it
+only removes unnecessary internal reset work while preserving the immediate-mode
+submission contract.
 
-### Design constraints
+A persistent topology API would require explicit lifetime, topology invalidation,
+restore behavior, full-vs-virtual override rules, and stale pin/link handling. It is
+deferred until per-frame virtual submission itself becomes a measured bottleneck.
 
-- normal immediate-mode `BeginNode()` must remain supported;
-- full submission should override/update retained geometry safely;
-- object lifetime must be explicit and debuggable;
-- stale pins/links must not survive topology changes;
-- save/restore semantics must remain compatible;
-- application code should not need to own editor-internal pointers.
+### Visible-path LOD
 
-### Exit criterion
+Possible low-zoom work includes:
 
-An unchanged off-screen node has effectively zero application/native submission work
-for that frame beyond whatever visible-query bookkeeping remains.
+- simplified pin rendering;
+- suppressing unreadable text/widgets;
+- reducing link tessellation/detail;
+- simplifying node shells/backgrounds;
+- reducing runtime effects such as flow/highlight rendering.
 
-## Phase 11 — Generation-based lifetime and hot lists
+This changes visible behavior and should be exposed as an explicit application/editor
+feature rather than introduced as an invisible internal optimization. The editor
+also cannot know which custom widgets are semantically safe to omit.
 
-**Priority: medium; pair with Phase 10 if measurements support it.**
+### Canvas/GPU transform or render caching
 
-Several frame-start/end operations still scale with total retained object count.
-Candidates include:
+Canvas local-space vertices are transformed on the CPU. GPU-side transforms or
+render caches could reduce CPU work for very large visible scenes, but they affect
+renderer/backend architecture and introduce additional invalidation, zoom/DPI,
+texture-memory, and compositing concerns.
 
-- reset/collect passes over all nodes, pins, and links;
-- clearing current-frame adjacency vectors/maps;
-- scans that only need fully-submitted or selected objects;
-- rebuilding temporary full-node lists.
+If render caching is eventually required, a tile/static-layer approach is preferable
+to one texture per node.
 
-Possible mechanisms:
+### Incremental settings output
 
-- `last_seen_frame` / generation counters instead of eager reset;
-- separate hot lists for full-submitted nodes;
-- separate active/selected object lists;
-- lazy adjacency generations;
-- deferred garbage collection for explicitly removed objects.
+The final serialized settings string could theoretically be maintained incrementally
+instead of calling a complete JSON `dump()`.
 
-Do not add generation machinery until benchmarks show these passes matter after
-virtual submission is reduced.
+That would complicate ordering, escaping, deletion, compatibility, and save-failure
+semantics for a cost that occurs only when settings are written. Keep the current
+cached-tree implementation unless real application save profiles justify a more
+complex writer.
 
-## Phase 12 — Visible-path LOD and draw overhead
-
-**Priority: workload-dependent.**
-
-Virtual nodes only help off-screen content. Very low zoom can still put hundreds or
-thousands of nodes on screen simultaneously.
-
-Potential work:
-
-- explicit low-zoom node LOD contract;
-- simplified pin rendering at very small scales;
-- suppress text/widgets below readability thresholds;
-- batch or simplify link flow/highlight effects;
-- cache text measurement/layout where application content is stable;
-- reduce draw-channel work for simple visible nodes;
-- avoid rebuilding static decorations when only runtime overlays change.
-
-Keep this mostly application-controlled: the node editor does not know which custom
-widgets are semantically safe to omit.
-
-## Phase 13 — Render caching, only if still needed
-
-**Priority: optional / late.**
-
-After CPU virtualization, spatial indexing, and LOD are measured, consider GPU/render
-caching for static content:
-
-- static canvas layer cache;
-- tile-based render textures;
-- cached node shells/backgrounds;
-- dirty-region redraw.
-
-This is intentionally late because render textures add invalidation, zoom/DPI,
-texture memory, and compositing complexity. They do not solve the original cost of
-submitting thousands of off-screen immediate-mode nodes as directly as virtual
-submission does.
-
-A tile cache is preferable to one texture per node if this phase becomes necessary.
-
-## Phase 14 — Group virtualization
-
-**Priority: optional.**
+### Group virtualization
 
 Native `Group()` nodes remain on the full path because their bounds, resizing,
 selection containment, and group hints have additional semantics.
 
-Virtualize groups only after tests cover:
+Virtualize groups only if required and only after coverage exists for:
 
 - group resize handles;
 - group movement with members;
@@ -241,61 +278,65 @@ Virtualize groups only after tests cover:
 - selection rectangles;
 - nested/overlapping behavior used by consumers.
 
-Do not weaken the normal group path just to make the API symmetrical.
+## Benchmarking future changes
+
+Do not add another optimization because it is theoretically faster. Measure the
+specific path first.
+
+Useful graph sizes include:
+
+```text
+1,000
+10,000
+100,000 nodes
+```
+
+with local links, high-degree/star links, and long cross-graph links tested
+separately when relevant.
+
+Useful timing regions include:
+
+- editor `Begin()`;
+- full and virtual node submission;
+- pin submission;
+- interaction broad phase;
+- spatial queries/rebuilds;
+- link submission/geometry update;
+- visible-link rebuild;
+- editor `End()`;
+- settings save/serialization when testing persistence.
+
+Representative scenarios should include idle, pan, zoom, one-node drag, multi-node
+drag, link hover, rectangle selection, and topology edits at several visible ratios.
 
 ## Upstream/rebase strategy
 
 Keep large-graph work isolated from compatibility work where possible.
 
-Recommended commit categories:
-
-```text
-fix: Dear ImGui compatibility
-
-test: compatibility/regression coverage
-
-feat: virtual node API
-
-perf: interaction/link/index optimization
-
-bench: large graph benchmark
-```
-
 When rebasing onto upstream:
 
-1. first make the upstream revision pass the compatibility suite with no large-graph
-   changes;
+1. make the upstream revision pass the compatibility suite before replaying
+   large-graph changes;
 2. replay virtual-node functionality;
-3. replay performance-only changes;
-4. run benchmark comparisons before/after each performance group.
+3. replay performance-only changes in small commits;
+4. compare representative profiles after each performance group;
+5. do not import an upstream fix that reintroduces full-graph scans without checking
+   it against the retained/spatial architecture in this fork.
 
-Avoid depending on private Dear ImGui internals beyond what the existing editor
-already requires unless there is a measured reason.
-
-## Consumer rollout order
-
-For TRAFFIQ or another existing editor:
-
-1. integrate the fork and binding changes;
-2. keep virtualization disabled by default;
-3. reuse existing node/pin layout caches;
-4. add Full / Editorless / Virtual routing;
-5. compare behavior and frame profiles on representative graphs;
-6. enable virtualization by default once interaction/save/restore regressions are
-   ruled out;
-7. collect benchmark data before starting Phase 9+.
+Avoid depending on additional private Dear ImGui internals unless there is a measured
+reason.
 
 ## Stop conditions
 
-Do not implement every phase automatically. Stop when representative workloads meet
-the product's frame budget with acceptable worst-case interaction latency.
+The current performance pass should be considered complete unless representative
+consumer workloads still show `imgui-node-editor` itself as the dominant frame cost.
 
-In particular, skip or postpone a phase when:
+Reopen deferred work only when:
 
-- its target cost is below measurement noise;
-- it increases invalidation/lifetime complexity more than it saves;
-- it mainly optimizes graph sizes the product does not need;
-- a consumer-side LOD/cache solves the same measured bottleneck more safely.
+- a profiler identifies the corresponding path as material;
+- the target graph size is relevant to the consumer;
+- the improvement is large enough to justify the additional lifetime/invalidation
+  complexity; and
+- the change can be covered by regression and performance tests.
 
-The roadmap is therefore ordered by evidence: **integrate, benchmark, then deepen
-retention only where the profile still demands it.**
+Do not optimize deferred items merely to make the roadmap complete.
