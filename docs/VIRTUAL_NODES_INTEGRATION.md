@@ -1,11 +1,12 @@
 # Virtual Nodes Integration Guide
 
-This document describes how to consume the large-graph extensions in this fork of
-`imgui-node-editor` without changing the normal full-node rendering path.
+This document explains how to use the large-graph virtual-node path in this fork of
+`imgui-node-editor` while keeping the normal full-node rendering path unchanged.
 
-The current implementation is intentionally incremental: applications keep their
-existing node renderer, add a retained geometry cache, and submit off-screen nodes
-through `SubmitVirtualNode()`.
+Virtual nodes are intended for nodes whose layout is already known but whose ImGui
+contents do not need to be submitted because the node is outside the visible canvas.
+The application retains the node size and pin geometry, then submits that retained
+geometry through `SubmitVirtualNode()`.
 
 ## Status
 
@@ -18,63 +19,24 @@ Implemented in this fork:
 - Interaction candidate culling.
 - Cached link geometry and visible-link filtering.
 - ID lookup indexes, link adjacency indexes, and retained spatial buckets.
-- Dirty-only Z-order sorting.
+- Generation-based object lifetime tracking.
+- Dirty-only Z-order sorting and redundant reorder avoidance.
 
-A virtual node is still submitted once per frame. Persistent virtual objects that
-require no per-frame submission are a later roadmap item.
+A virtual node is still submitted once per frame. Persistent virtual topology that
+requires no per-frame node/link submission is not implemented.
 
-## Requirements
+## Quick start
 
-- Submit nodes before links, as with the normal API.
-- A node must be measured by a full submission before it can be virtualized safely.
-- The application must retain the node size and node-local pin bounds/pivots used by
-  `VirtualNodeDesc`.
-- A virtual descriptor must contain every pin needed by links or interaction in that
-  frame.
-- Native `Group()` nodes are not supported by the virtual path yet.
+A typical application needs only this policy:
 
-Unknown or unmeasured nodes are treated as visible by `IsNodeVisible()`, which makes
-falling back to a full submission the safe default.
+1. Fully submit a node while its retained geometry is unknown or invalid.
+2. Cache the node size and every pin's bounds/pivot in node-local coordinates.
+3. On later frames, fully submit visible nodes and virtually submit off-screen nodes.
+4. Submit links only after all full and virtual nodes have been submitted.
 
-## Public API
-
-The large-graph path adds these calls:
-
-```cpp
-bool SubmitVirtualNode(const VirtualNodeDesc& desc);
-bool IsNodeVisible(NodeId id, float margin = 0.0f);
-void GetVisibleCanvasBounds(ImVec2* min, ImVec2* max);
-```
-
-Descriptors use node-local coordinates:
-
-```cpp
-struct VirtualPinDesc
-{
-    PinId   Id;
-    PinKind Kind;
-    ImVec2  BoundsMinOffset;
-    ImVec2  BoundsMaxOffset;
-    ImVec2  PivotMinOffset;
-    ImVec2  PivotMaxOffset;
-};
-
-struct VirtualNodeDesc
-{
-    NodeId                Id;
-    ImVec2                Size;
-    const VirtualPinDesc* Pins;
-    int                   PinCount;
-};
-```
-
-`SubmitVirtualNode()` returns `false` when the descriptor or submission state is
-invalid. Treat that as a request to use a full submission on the next safe frame,
-not as a reason to silently drop the node.
-
-## Recommended frame flow
-
-Use an overscan margin so nodes do not rapidly switch paths at the viewport edge.
+`IsNodeVisible()` returns `true` for an unknown node, so this naturally sends a new
+node through the full path first when the application does not already know its exact
+geometry.
 
 ```cpp
 ed::Begin("Graph");
@@ -85,14 +47,13 @@ for (auto& node : graph.Nodes)
 
     const bool needsFull =
         !cache.Valid ||
-        cache.LayoutRevision != node.LayoutRevision ||
+        node.GeometryDirty ||
         ed::IsNodeVisible(node.Id, 128.0f);
 
     if (needsFull)
     {
-        ed::BeginNode(node.Id);
-        DrawNodeAndPins(node, cache); // refresh cache while layout is known
-        ed::EndNode();
+        DrawFullNodeAndUpdateCache(node, cache);
+        node.GeometryDirty = false;
     }
     else
     {
@@ -107,96 +68,260 @@ for (auto& node : graph.Nodes)
     }
 }
 
-// Links come after both full and virtual nodes so all endpoint pins are live.
+// All endpoint pins must already be live before links are submitted.
 for (auto& link : graph.Links)
     ed::Link(link.Id, link.StartPin, link.EndPin, link.Color, link.Thickness);
 
 ed::End();
 ```
 
-If a failed virtual submission must be recovered in the same frame, structure the
-application renderer so it can fall back to full submission before links are
-submitted. Otherwise mark the cache invalid and recover on the next frame.
+`GeometryDirty` in this example is application state, not an
+`imgui-node-editor` API. A layout revision, dirty bit, or equivalent mechanism is
+fine as long as the cache is invalidated whenever node or pin geometry changes.
 
-## Geometry cache
+If `SubmitVirtualNode()` returns `false`, do not silently omit that node forever.
+Invalidate its cache and fully submit it on the next safe frame. An application that
+needs same-frame recovery can perform the full fallback before it starts submitting
+links.
 
-The application owns the descriptor cache. A practical cache is:
+## What must be cached
+
+The application owns the virtual geometry cache. A minimal cache is:
 
 ```cpp
 struct CachedVirtualNode
 {
     bool Valid = false;
-    uint64_t LayoutRevision = 0;
     ImVec2 Size = {};
     std::vector<ed::VirtualPinDesc> Pins;
 };
 ```
 
-Store pin rectangles and pivots relative to the node origin, never in screen space.
-That lets the editor translate retained pin geometry together with a dragged virtual
-node.
+Each `VirtualPinDesc` stores the same pin bounds and pivot geometry used by the full
+renderer, but as offsets from the node origin:
 
-This fork does not currently expose a public API that reconstructs
-`VirtualNodeDesc` from an already-submitted node. The consumer should capture these
-values from its own layout/pin geometry data while doing a full render. Applications
-that already cache pin centers, hit rectangles, or node layout can usually derive the
-descriptor directly from that data.
+```cpp
+struct VirtualPinDesc
+{
+    PinId   Id;
+    PinKind Kind;
+    ImVec2  BoundsMinOffset;
+    ImVec2  BoundsMaxOffset;
+    ImVec2  PivotMinOffset;
+    ImVec2  PivotMaxOffset;
+};
+```
+
+The node descriptor is only a view of that retained data:
+
+```cpp
+struct VirtualNodeDesc
+{
+    NodeId                Id;
+    ImVec2                Size;
+    const VirtualPinDesc* Pins;
+    int                   PinCount;
+};
+```
+
+The pin array only has to remain valid for the duration of the
+`SubmitVirtualNode()` call; the editor consumes the descriptor synchronously.
+
+## Cache geometry during a full submission
+
+There is intentionally no public `GetPinBounds()` or `GetPinPivot()` API. The
+application should cache geometry from the same layout data it already uses while
+fully rendering the node.
+
+The clearest case is a renderer that explicitly supplies `PinRect()` and
+`PinPivotRect()`. Keep those rectangles, then convert them to node-local offsets.
+
+```cpp
+struct FullPinGeometry
+{
+    ed::PinId Id;
+    ed::PinKind Kind;
+    ImVec2 BoundsMin;
+    ImVec2 BoundsMax;
+    ImVec2 PivotMin;
+    ImVec2 PivotMax;
+};
+
+static ed::VirtualPinDesc MakeVirtualPin(
+    const FullPinGeometry& pin,
+    const ImVec2& nodeOrigin)
+{
+    ed::VirtualPinDesc result;
+    result.Id               = pin.Id;
+    result.Kind             = pin.Kind;
+    result.BoundsMinOffset  = pin.BoundsMin - nodeOrigin;
+    result.BoundsMaxOffset  = pin.BoundsMax - nodeOrigin;
+    result.PivotMinOffset   = pin.PivotMin - nodeOrigin;
+    result.PivotMaxOffset   = pin.PivotMax - nodeOrigin;
+    return result;
+}
+```
+
+A full renderer can then update the retained descriptor after `EndNode()`:
+
+```cpp
+void DrawFullNodeAndUpdateCache(Node& node, CachedVirtualNode& cache)
+{
+    std::vector<FullPinGeometry> measuredPins;
+
+    ed::BeginNode(node.Id);
+
+    // Draw the node contents normally. For each pin, retain the exact rectangles
+    // used by PinRect()/PinPivotRect() in measuredPins.
+    DrawNodeContents(node, measuredPins);
+
+    ed::EndNode();
+
+    const ImVec2 nodeOrigin = ed::GetNodePosition(node.Id);
+
+    cache.Size = ed::GetNodeSize(node.Id);
+    cache.Pins.clear();
+    cache.Pins.reserve(measuredPins.size());
+
+    for (const auto& pin : measuredPins)
+        cache.Pins.push_back(MakeVirtualPin(pin, nodeOrigin));
+
+    cache.Valid = true;
+}
+```
+
+For example, when the full renderer already knows a pin rectangle and pivot:
+
+```cpp
+ed::BeginPin(pin.Id, pin.Kind);
+DrawPinContents(pin);
+ed::PinRect(pin.BoundsMin, pin.BoundsMax);
+ed::PinPivotRect(pin.PivotMin, pin.PivotMax);
+ed::EndPin();
+
+measuredPins.push_back({
+    pin.Id,
+    pin.Kind,
+    pin.BoundsMin,
+    pin.BoundsMax,
+    pin.PivotMin,
+    pin.PivotMax,
+});
+```
+
+Applications that let `EndPin()` infer the bounds from the last ImGui item instead
+must retain equivalent geometry in their own renderer/layout cache. The current
+public API does not expose the inferred internal pin rectangles after submission.
+
+A full submission is therefore the normal bootstrap path when geometry comes from
+ImGui measurement. It is not a hard API requirement if an application already knows
+an exact node size and exact pin bounds/pivots from its own layout system.
+
+## Coordinate rules
+
+`VirtualPinDesc` coordinates are node-local offsets, not absolute canvas or screen
+coordinates.
+
+For a node at `nodeOrigin`:
+
+```text
+BoundsMinOffset = absolutePinBoundsMin - nodeOrigin
+BoundsMaxOffset = absolutePinBoundsMax - nodeOrigin
+PivotMinOffset  = absolutePinPivotMin  - nodeOrigin
+PivotMaxOffset  = absolutePinPivotMax  - nodeOrigin
+```
+
+Do not regenerate the descriptor just because the node moves. The editor retains the
+node position and translates the cached pin geometry with it.
+
+`GetVisibleCanvasBounds()` returns the current visible rectangle in node-editor
+canvas-local space. It is optional; use it when application-level culling needs the
+same visible bounds used by the editor.
+
+## Public API
+
+The virtual-node path adds these calls:
+
+```cpp
+bool SubmitVirtualNode(const VirtualNodeDesc& desc);
+bool IsNodeVisible(NodeId id, float margin = 0.0f);
+void GetVisibleCanvasBounds(ImVec2* min, ImVec2* max);
+```
+
+### `SubmitVirtualNode()`
+
+Submits retained node/pin geometry without emitting normal node contents or allocating
+node draw channels. It returns `false` when the descriptor or current submission
+state is invalid.
+
+Important descriptor rules enforced by the implementation include:
+
+- `Id` must be valid.
+- `Size` must be finite and non-negative.
+- `PinCount` must be non-negative.
+- `Pins` must be non-null when `PinCount > 0`.
+- every pin ID must be valid and unique within the descriptor;
+- every pin kind must be `Input` or `Output`;
+- all bounds/pivot coordinates must be finite and ordered min-to-max;
+- the same node or pin cannot already have been submitted in that frame;
+- native `Group()` nodes cannot use the virtual path.
+
+### `IsNodeVisible()`
+
+Tests the retained node bounds against the current view. `margin` expands the visible
+rectangle, so a positive overscan such as `128.0f` prevents rapid switching at the
+viewport edge.
+
+Unknown or not-yet-sized nodes return `true`, which makes a full submission the safe
+default.
+
+### `GetVisibleCanvasBounds()`
+
+Returns the current visible canvas rectangle. Either output pointer may be `nullptr`.
+This is useful for application-side spatial queries, but it is not required for the
+basic virtual-node flow.
 
 ## Cache invalidation
 
-Force a full submission when any input that can change node or pin geometry changes.
-At minimum invalidate on:
+Force a full submission whenever an input that can change node or pin geometry
+changes. Typical invalidation events include:
 
-- first appearance of a node;
-- node type or dynamic port count change;
-- pin insertion, removal, order, or kind change;
-- node layout revision change;
-- font, DPI, UI scale, or style change that affects geometry;
-- title/label/content change that changes measured size;
-- expand/collapse or LOD transition that changes layout;
+- first appearance of a node when exact geometry is not already known;
+- node type or dynamic port count changes;
+- pin insertion, removal, order, or kind changes;
+- application layout revision changes;
+- font, DPI, UI scale, or style changes that affect geometry;
+- title, label, or content changes that change measured size;
+- expand/collapse or application LOD transitions that change layout;
 - explicit application-side resize;
 - restore/import when cached geometry is not known to match the restored layout.
 
-Position changes do **not** require descriptor regeneration. The editor retains the
-node position and translates virtual pin geometry with the node.
-
-## Full, editorless, and virtual LOD
-
-For applications that already have a lightweight on-screen renderer, use three
-levels rather than replacing it:
-
-```text
-Full       visible + normal zoom        complete widgets/editors
-Editorless visible + low zoom           simplified body, pins still submitted normally
-Virtual    outside overscan             no ImGui node contents or per-node draw channels
-```
-
-Virtualization solves off-screen CPU submission cost. Editorless/LOD still matters
-for many nodes that are simultaneously visible after zooming out.
+Position changes alone do **not** require descriptor regeneration.
 
 ## Links
 
-Links must still be submitted each frame after their endpoint nodes/pins.
+Links must still be submitted each frame after all endpoint nodes/pins have been
+submitted, whether those endpoints used the full or virtual path.
 
-The fork caches each live link's Bezier geometry/bounds and uses retained spatial
-buckets for visible-link queries and hover candidates. A link whose endpoints are
-both outside the viewport is still considered when its curve crosses the viewport.
+The fork caches live-link Bezier geometry/bounds and uses retained spatial buckets for
+visible-link queries and hover candidates. A link whose endpoint nodes are both
+off-screen is still considered when its curve crosses the viewport.
 
 Do not application-cull a link solely because both endpoint nodes are off-screen.
-If link submission itself becomes a bottleneck, persistent topology is a later
-roadmap item.
+Persistent topology that removes per-frame link submission is a separate deferred
+optimization.
 
 ## Interaction and selection
 
-Virtual nodes remain live editor objects. Retained geometry is used for broad-phase
-interaction, selection, and link endpoint updates.
+Virtual nodes remain live editor objects. Retained geometry participates in
+broad-phase interaction, selection, and link endpoint updates.
+
+Selected virtual nodes can move without forcing a full render. Their retained pin
+bounds/pivots move with the node, and adjacent link endpoints are refreshed.
 
 The editor creates expensive ImGui interaction items only for nearby cursor
 candidates and active drag/resize targets. Spatial buckets reduce the candidate set
 before exact hit testing.
-
-Selected virtual nodes can be moved without forcing a full render. Their retained
-pin bounds and pivots move with the node, and adjacent link endpoints are refreshed.
 
 ## Draw-list behavior
 
@@ -208,81 +333,82 @@ ed::GetNodeBackgroundDrawList(virtualNodeId)
 
 returns `nullptr`.
 
-Custom decorations that require the node background draw list should either:
-
-- be drawn only for full/editorless visible nodes; or
-- use an application-level canvas layer that is not tied to a node draw channel.
-
-Do not dereference the result without checking it.
+Custom decorations that require the node background draw list should either be drawn
+only for fully submitted visible nodes, or use an application-level canvas layer that
+is not tied to a node draw channel. Always check the returned pointer before use.
 
 ## Native groups
 
-`SubmitVirtualNode()` deliberately rejects native `Group()` nodes in the current
-implementation. Keep groups fully submitted until group-specific retained geometry,
-resize interaction, and group hints have dedicated coverage.
+`SubmitVirtualNode()` deliberately rejects native `Group()` nodes. Keep native groups
+on the full path until retained group geometry, resize interaction, and group hints
+have dedicated support.
 
-Applications with their own non-native visual grouping can virtualize the ordinary
-member nodes normally.
+Applications with their own non-native visual grouping can virtualize ordinary member
+nodes normally.
 
-## Rust / FFI consumers
+## Application-side LOD
 
-A Rust consumer needs the new API exposed through every binding layer. For the
-`dear-node-editor` stack used by TRAFFIQ, the expected path is:
+Virtual nodes solve off-screen submission cost. They do not reduce the cost of many
+nodes that are simultaneously visible after zooming out.
+
+An application may combine this API with its own visible-node LOD, for example:
 
 ```text
-application
-  -> dear-node-editor        safe Rust wrapper
-  -> dear-node-editor-sys    generated/raw FFI
-  -> C wrapper
-  -> this imgui-node-editor fork
+Full       visible + normal zoom        complete widgets/editors
+Simplified visible + low zoom           application-defined lightweight contents
+Virtual    outside overscan             retained geometry only
 ```
 
-Expose POD equivalents of `VirtualPinDesc` and `VirtualNodeDesc`, plus:
+`Simplified`/`Editorless` rendering is an application strategy, not a separate
+`imgui-node-editor` API. Any LOD that changes measured node or pin geometry must
+invalidate the virtual geometry cache.
+
+## FFI bindings
+
+Bindings must expose POD equivalents of `VirtualPinDesc` and `VirtualNodeDesc`, plus:
 
 - `SubmitVirtualNode`
 - `IsNodeVisible`
 - `GetVisibleCanvasBounds`
 
-The safe wrapper should accept a borrowed pin slice and build a descriptor whose
-pointer remains valid for the duration of the native call. Do not retain the Rust
-slice pointer in C++; the current native implementation consumes descriptor data
-synchronously.
+A safe wrapper can accept a borrowed pin slice and build a descriptor whose pointer
+remains valid for the native call. The current C++ implementation consumes descriptor
+data synchronously and does not retain the caller's pin-array pointer.
 
-For TRAFFIQ specifically, the existing cached node size and pin geometry used by its
-editorless LOD should be reused instead of creating a second geometry model.
+Reuse existing application layout geometry where possible instead of maintaining a
+second independent geometry model for virtualization.
 
 ## Validation checklist
 
 Before enabling virtualization by default, verify:
 
 - full-only mode still behaves exactly as before;
-- a newly-created node is full-submitted at least once;
+- newly-created nodes reach the full path until valid geometry exists;
 - off-screen nodes remain selectable by rectangle selection;
-- virtual selected nodes drag correctly;
+- selected virtual nodes drag correctly;
 - pins and links follow a moved virtual node;
 - links crossing the viewport remain visible/hittable;
 - link creation/deletion and context menus still work near viewport boundaries;
 - settings/layout save and restore keep correct positions and sizes;
 - zoom and pan across the full/virtual boundary do not cause jumps;
 - dynamic-port nodes invalidate their geometry cache;
-- group nodes remain on the full path;
+- native group nodes remain on the full path;
 - `GetNodeBackgroundDrawList()` callers tolerate `nullptr` for virtual nodes.
 
-The repository's headless compatibility suite should also remain green with both the
+The repository's headless compatibility suite should remain green with both the
 bundled Dear ImGui and the currently supported external Dear ImGui version.
 
 ## Performance rollout
 
-Enable the feature behind an application switch first. Compare identical graphs in:
+Compare identical graphs with virtualization disabled and enabled. Measure at least:
 
-1. full-only mode;
-2. full + editorless LOD;
-3. full + editorless + virtual nodes.
+- idle;
+- pan and zoom;
+- node drag;
+- link hover;
+- rectangle selection;
+- several visible-node ratios.
 
-Measure at least idle, pan, zoom, node drag, link hover, and rectangle selection.
-Test several visible ratios; a 10,000-node graph with 1% visible stresses a different
-path than a 1,000-node graph with 90% visible.
-
-The immediate success criterion is that off-screen node cost approaches the cost of
-a descriptor submission rather than a normal `BeginNode`/pin/content path, without
-changing editor behavior.
+A 10,000-node graph with 1% visible stresses a different path from a 1,000-node graph
+with 90% visible. The useful criterion is that off-screen node cost approaches the
+cost of descriptor submission while editor behavior remains unchanged.
